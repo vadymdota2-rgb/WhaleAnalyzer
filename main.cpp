@@ -1,14 +1,6 @@
 // ============================================================================
-//  Analyzer Bot v1.0 FINAL PRODUCTION HARDENED (FIXED — compiles cleanly)
+//  Analyzer Bot v1.0 FINAL — Production-Ready (Frozen for Soak Test)
 //  Compile: g++ -std=c++17 -O2 analyzer.cpp -o analyzer -lsqlite3 -lpthread -lssl -lcrypto
-//
-//  Fixes applied vs the previous draft:
-//   1. DB::mtx_ marked `mutable`; all read-only DB methods marked `const`
-//      so that BotStats::loadFromDb(const DB&) and TgBot::sendStats/sendHealth
-//      (which take `const DB&`) actually compile.
-//   2. Removed the nonexistent `db.getCounter()` call in main(); replaced
-//      with `db.getTotalProcessed()`, which is what CLEANUP_TRIGGER is
-//      meant to track (row count in processed_tx).
 // ============================================================================
 
 #include <httplib.h>
@@ -46,133 +38,77 @@ namespace fs = std::filesystem;
 // ============================================================================
 namespace cfg {
 
-// FIX #13 (review point #6): previously a hardcoded `const std::string
-// BOT_TOKEN = "..."` baked into the source (and the binary). Anyone with
-// the binary or the repo had the token. getBotToken() reads it from the
-// BOT_TOKEN environment variable instead, which is the standard way to
-// keep secrets out of source control and out of the compiled artifact.
-// The hardcoded string below is kept only as an obvious placeholder
-// fallback so the bot fails loudly (via the warning below) instead of
-// silently if someone forgets to set the env var — it is NOT meant to
-// ever be a real token.
 inline const std::string& getBotToken() {
     static const std::string token = []() -> std::string {
         const char* envVal = std::getenv("BOT_TOKEN");
-        if (envVal && envVal[0] != '\0') {
-            return std::string(envVal);
-        }
-        std::cerr << "[WARN] BOT_TOKEN environment variable is not set; "
-                     "falling back to placeholder \"YOUR_BOT_TOKEN\". "
-                     "Set BOT_TOKEN before running in production.\n";
-        return "YOUR_BOT_TOKEN";
+        if (envVal && envVal[0] != '\0') return std::string(envVal);
+        std::cerr << "[FATAL] BOT_TOKEN environment variable is not set.\n";
+        std::exit(1);
     }();
     return token;
 }
+const int64_t SOURCE_CHANNEL = -1001234567890LL;   // Replace with real ID
+const int64_t OUTPUT_CHANNEL = -1009876543210LL;   // Replace with real ID
+const int64_t ADMIN_ID       = 123456789;          // Replace with your Telegram user ID
 
-const int64_t     SOURCE_CHANNEL   = -1001234567890LL;
-const int64_t     OUTPUT_CHANNEL   = -1009876543210LL;
-const int64_t     ADMIN_ID         = 123456789;  // Твой Telegram user ID
-
+// 5 high-quality RPC nodes — better than 15 with half degraded
 const std::vector<std::string> BSC_RPC = {
     "https://bsc-dataseed1.binance.org",
     "https://bsc-dataseed2.binance.org",
-    "https://bsc-dataseed3.binance.org",
-    "https://bsc-dataseed4.binance.org",
     "https://bsc.publicnode.com",
-    "https://rpc.ankr.com/bsc"
+    "https://rpc.ankr.com/bsc",
+    "https://1rpc.io/bnb",
 };
 
-// Stablecoins для классификации BUY/SELL (адреса проверены на BSCScan)
 const std::vector<std::string> STABLECOINS = {
     "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", // WBNB
-    "0x55d398326f99059ff775485246999027b3197955", // USDT (BSC-USD)
+    "0x55d398326f99059ff775485246999027b3197955", // USDT
     "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
     "0xe9e7cea3dedca5984780bafc599bd69add087d56", // BUSD
-    "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409", // FDUSD (First Digital)
-    "0xd17479997f34dd9156deef8f95a52d81d265be9c"  // USDD (Decentralized USD)
+    "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409", // FDUSD
+    "0xd17479997f34dd9156deef8f95a52d81d265be9c"  // USDD
 };
 
-const std::string DEXSCREENER_BASE  = "https://api.dexscreener.com";
-const std::string GECKO_BASE        = "https://api.geckoterminal.com";
+const std::string DEXSCREENER_BASE = "https://api.dexscreener.com";
+const std::string GECKO_BASE       = "https://api.geckoterminal.com";
 
-const std::string DB_PATH = "analyzer.db";
-const int CLEANUP_TRIGGER   = 200;
-const int KEEP_LAST_TX      = 500;
-const int POLL_TIMEOUT_SEC  = 30;
-const int RSI_PERIOD        = 14;
-const int MIN_OHLCV_FOR_1H  = 120;
-const size_t MAX_LOG_SIZE_MB = 10;
-
-// Health check timeouts (быстрые проверки)
-const int HEALTH_TIMEOUT_MS = 1500;
-
-// Maintenance interval (VACUUM раз в сутки)
+const std::string DB_PATH          = "analyzer.db";
+const int CLEANUP_TRIGGER          = 200;
+const int POLL_TIMEOUT_SEC         = 30;
+const int RSI_PERIOD               = 14;
+const int MIN_OHLCV_FOR_1H         = 120;
+const size_t MAX_LOG_SIZE_MB       = 10;
+const int HEALTH_TIMEOUT_MS        = 1500;
 const int MAINTENANCE_INTERVAL_HOURS = 24;
-
-// FIX #4: number of worker threads draining the whale-tx processing queue.
-// Each worker does RPC calls + market-data fetches + Telegram publish for
-// one tx at a time; 2-4 is enough to absorb a few concurrent slow lookups
-// without reading too many BSC RPC nodes / market APIs in parallel and
-// risking their own rate limits.
-//
-// Note (review point #3): all DB access from every worker, the poller, the
-// maintenance thread, the watchdog, and the stale-task reclaimer goes
-// through DB's single mtx_ — there's exactly one sqlite3* connection,
-// serializing every read and write. This is correct (no races) but caps
-// total DB throughput regardless of how many workers you run; it does not
-// scale linearly past a handful of workers. That's an acceptable tradeoff
-// at this volume (a Telegram whale-alert channel) since DB operations here
-// are tiny key lookups/updates, not the bottleneck — RPC and market-API
-// HTTP calls dominate per-task latency by orders of magnitude. If
-// NUM_WORKER_THREADS is ever raised well into double digits, revisit this:
-// options include a connection-per-thread pool (SQLite supports concurrent
-// readers in WAL mode; writes still serialize) or moving off SQLite to a
-// server-based DB.
-const int NUM_WORKER_THREADS = 3;
-
-// FIX #8: cap on TaskQueue's pending-task backlog. If the source channel
-// bursts far faster than workers can drain (slow RPC/market APIs), push()
-// blocks the poller once this many tasks are queued instead of growing
-// memory without bound. Sized generously above normal whale-alert volume;
-// tune based on observed peak burst rate vs. worker throughput.
-const size_t MAX_QUEUE_SIZE = 1000;
-
-// FIX #10 (review point #1): how often to scan for, and the age threshold
-// for, status=0 rows that have been "claimed" longer than any healthy task
-// should take. Set the TTL well above the worst-case sum of every internal
-// HTTP timeout in the pipeline (RPC retries + DexScreener + GeckoTerminal +
-// Telegram sendMessage's own 429 retry loop), so this only fires for tasks
-// that are genuinely stuck, not ones merely waiting on a slow API.
+const int NUM_WORKER_THREADS       = 3;
+const size_t MAX_QUEUE_SIZE        = 1000;
+const size_t MAX_TG_QUEUE_SIZE     = 5000;
 const int STALE_TASK_CHECK_INTERVAL_SEC = 120;
 const int64_t STALE_TASK_TTL_SECONDS    = 600;
-
-// FIX #11 (review point #5): worker heartbeat watchdog. If a worker's
-// heartbeat hasn't moved in WORKER_HANG_TIMEOUT_SEC, it's considered hung
-// and a replacement worker is started for that pool slot (the original
-// hung thread is left running; see WorkerHeartbeats for why it can't be
-// safely killed). WORKER_HANG_TIMEOUT_SEC should be noticeably larger than
-// STALE_TASK_TTL_SECONDS: a hung worker will naturally show up as a stale
-// DB row first, and this is a second, independent safety net specifically
-// against the pool's effective concurrency silently shrinking over time.
+const int MAX_RECLAIM_ATTEMPTS     = 5;
+const int STALE_RECLAIMER_PUSH_TIMEOUT_MS = 3000;
 const int WORKER_HEARTBEAT_CHECK_INTERVAL_SEC = 60;
-const int64_t WORKER_HANG_TIMEOUT_SEC         = 900;
+const int64_t WORKER_HANG_TIMEOUT_SEC    = 900;
+const int MAX_WORKER_REPLACEMENTS_PER_SLOT = 10;
+const int64_t HEALTH_COMMAND_COOLDOWN_SEC  = 30;
+const int64_t QUEUE_BLOCKED_WARN_MS        = 5000;
 
-// FIX #12 (review point #4): minimum gap, in seconds, between two /health
-// invocations. /health makes outbound calls to Telegram, DexScreener,
-// GeckoTerminal, and a BSC RPC node every time it runs; without a cooldown
-// an admin spamming the command (accidentally or via a misbehaving client)
-// could trip rate limits on those third-party APIs.
-const int64_t HEALTH_COMMAND_COOLDOWN_SEC = 30;
+// Time-based retention + hard cap
+const int RETENTION_DAYS_DONE      = 30;
+const int RETENTION_DAYS_ABANDONED = 90;
+const int MAX_DONE_RECORDS         = 500000;
+// RPC circuit breaker
+const int RPC_CIRCUIT_FAILURE_THRESHOLD = 5;
+const int RPC_CIRCUIT_DISABLE_SECONDS   = 600; // 10 minutes
 
-// FIX #14 (review point #2): how long the poller can block inside
-// queue.push() before it's worth a log warning. Purely observability —
-// does not change push()'s blocking/backpressure behavior.
-const int64_t QUEUE_BLOCKED_WARN_MS = 5000;
+// Market data circuit breaker
+const int MARKET_CIRCUIT_WINDOW_SEC     = 300;   // 5 minutes
+const int MARKET_CIRCUIT_THRESHOLD      = 100;   // failures in window
 
 } // namespace cfg
 
 // ============================================================================
-//  LOGGER (с ротацией)
+//  LOGGER (with rotation)
 // ============================================================================
 class Logger {
 public:
@@ -186,7 +122,13 @@ public:
         auto now = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(now);
         char buf[32];
-        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&t));
+        struct tm tmBuf;
+#if defined(_WIN32)
+        localtime_s(&tmBuf, &t);
+#else
+        localtime_r(&t, &tmBuf);
+#endif
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmBuf);
         const char* tag = lvl == INFO ? "INFO" : (lvl == WARN ? "WARN" : "ERR");
 
         std::ofstream f("logs/analyzer.log", std::ios::app);
@@ -199,14 +141,10 @@ private:
     static void checkAndRotate() {
         static int checkCounter = 0;
         if (++checkCounter % 100 != 0) return;
-
         std::error_code ec;
         auto size = fs::file_size("logs/analyzer.log", ec);
-        if (ec || size > cfg::MAX_LOG_SIZE_MB * 1024 * 1024) {
-            rotate();
-        }
+        if (ec || size > cfg::MAX_LOG_SIZE_MB * 1024 * 1024) rotate();
     }
-
     static void rotate() {
         std::error_code ec;
         fs::remove("logs/analyzer.log.3", ec);
@@ -221,32 +159,24 @@ private:
 #define LOG_ERR(m)  Logger::log(Logger::ERR,  m)
 
 // ============================================================================
-//  HTTP CLIENT (с HttpResponse для правильной обработки 429)
+//  HTTP CLIENT
 // ============================================================================
 namespace Http {
 
 struct UrlParts {
-    std::string scheme;
-    std::string host;
-    int         port;
-    std::string path;
+    std::string scheme, host, path;
+    int port;
 };
 
 UrlParts parseUrl(const std::string& url) {
     UrlParts p;
     auto schemeEnd = url.find("://");
-    if (schemeEnd == std::string::npos) {
-        p.scheme = "http";
-        schemeEnd = 0;
-    } else {
-        p.scheme = url.substr(0, schemeEnd);
-        schemeEnd += 3;
-    }
+    if (schemeEnd == std::string::npos) { p.scheme = "http"; schemeEnd = 0; }
+    else { p.scheme = url.substr(0, schemeEnd); schemeEnd += 3; }
     auto pathStart = url.find('/', schemeEnd);
     std::string hostPart = (pathStart == std::string::npos)
         ? url.substr(schemeEnd) : url.substr(schemeEnd, pathStart - schemeEnd);
     p.path = (pathStart == std::string::npos) ? "/" : url.substr(pathStart);
-
     auto colonPos = hostPart.find(':');
     if (colonPos != std::string::npos) {
         p.host = hostPart.substr(0, colonPos);
@@ -258,14 +188,12 @@ UrlParts parseUrl(const std::string& url) {
     return p;
 }
 
-// HttpResponse — ключевое для обработки 429
 struct HttpResponse {
     int status = 0;
     std::string body;
     json parsed;
     bool ok() const { return status == 200; }
 };
-
 template<typename Client>
 HttpResponse doRequest(Client& cli, const std::string& path, int timeout_ms, int retries,
                        const std::string* body = nullptr, const std::string* contentType = nullptr) {
@@ -275,34 +203,21 @@ HttpResponse doRequest(Client& cli, const std::string& path, int timeout_ms, int
     HttpResponse resp;
     for (int i = 0; i <= retries; ++i) {
         std::shared_ptr<httplib::Response> res;
-        if (body && contentType) {
-            res = cli.Post(path.c_str(), *body, contentType->c_str());
-        } else {
-            res = cli.Get(path.c_str());
-        }
+        if (body && contentType) res = cli.Post(path.c_str(), *body, contentType->c_str());
+        else res = cli.Get(path.c_str());
 
         if (res) {
             resp.status = res->status;
             resp.body = res->body;
-
             if (res->status == 200) {
                 try { resp.parsed = json::parse(res->body); return resp; }
-                catch (...) {
-                    LOG_WARN("JSON parse fail, retrying");
-                    resp.status = 0; // invalid
-                }
+                catch (...) { resp.status = 0; }
             } else if (res->status == 429) {
-                // 429 — возвращаем сразу, пусть вызывающий код обрабатывает retry_after
                 try { resp.parsed = json::parse(res->body); } catch (...) {}
                 return resp;
             }
-
-            LOG_WARN("HTTP " + std::to_string(res->status) + " retry=" + std::to_string(i));
         }
-
-        if (i < retries) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500 * (i + 1)));
-        }
+        if (i < retries) std::this_thread::sleep_for(std::chrono::milliseconds(500 * (i + 1)));
     }
     return resp;
 }
@@ -319,8 +234,7 @@ HttpResponse get(const std::string& url, int timeout_ms = 8000, int retries = 2)
     }
 }
 
-HttpResponse post(const std::string& url, const json& body,
-                  int timeout_ms = 8000, int retries = 2) {
+HttpResponse post(const std::string& url, const json& body, int timeout_ms = 8000, int retries = 2) {
     auto p = parseUrl(url);
     std::string dump = body.dump();
     if (p.scheme == "https") {
@@ -329,11 +243,9 @@ HttpResponse post(const std::string& url, const json& body,
         return doRequest(cli, p.path, timeout_ms, retries, &dump, "application/json");
     } else {
         httplib::Client cli(p.host, p.port);
-        return doRequest(cli, p.path, timeout_ms, retries, &dump, "application/json");
-    }
+        return doRequest(cli, p.path, timeout_ms, retries, &dump, "application/json");    }
 }
 
-// Convenience wrappers для обратной совместимости
 bool getJson(const std::string& url, json& out, int timeout_ms = 8000, int retries = 2) {
     auto r = get(url, timeout_ms, retries);
     if (r.ok()) { out = r.parsed; return true; }
@@ -343,18 +255,44 @@ bool getJson(const std::string& url, json& out, int timeout_ms = 8000, int retri
 } // namespace Http
 
 // ============================================================================
-//  DATABASE (SQLite WAL + persistent stats + ping)
-//  FIX: mtx_ is now `mutable`, and every read-only method is `const`,
-//  so this class can be used behind `const DB&` references (BotStats,
-//  TgBot::sendStats/sendHealth) without compile errors.
+//  DATA STRUCTURES
+// ============================================================================
+struct ParsedMsg {
+    std::string whaleName, txHash, contract, coin, amount, quantity, whaleAddr;
+};
+
+json pToJson(const ParsedMsg& p) {
+    return { {"whaleName", p.whaleName}, {"txHash", p.txHash}, {"contract", p.contract},
+             {"coin", p.coin}, {"amount", p.amount}, {"quantity", p.quantity}, {"whaleAddr", p.whaleAddr} };
+}
+
+ParsedMsg pFromJson(const json& j) {
+    ParsedMsg p;
+    if (j.is_null()) return p;
+    p.whaleName = j.value("whaleName", "");
+    p.txHash    = j.value("txHash", "");
+    p.contract  = j.value("contract", "");
+    p.coin      = j.value("coin", "");
+    p.amount    = j.value("amount", "");
+    p.quantity  = j.value("quantity", "");
+    p.whaleAddr = j.value("whaleAddr", "");
+    return p;
+}
+
+struct WhaleTask {
+    ParsedMsg parsed;
+    std::string txLower;
+    int64_t enqueueTs = 0; // timestamp when task was enqueued
+};
+
+// ============================================================================
+//  DATABASE (SQLite WAL + persistent stats)
 // ============================================================================
 class DB {
     sqlite3* db_ = nullptr;
     mutable std::mutex mtx_;
 
-    // Persistent stats keys
-    static constexpr const char* KEY_MESSAGES   = "stats_messages";
-    static constexpr const char* KEY_TX_OK      = "stats_tx_ok";
+    static constexpr const char* KEY_MESSAGES   = "stats_messages";    static constexpr const char* KEY_TX_OK      = "stats_tx_ok";
     static constexpr const char* KEY_ERRORS     = "stats_errors";
     static constexpr const char* KEY_RPC_ERR    = "stats_rpc_err";
     static constexpr const char* KEY_MARKET_ERR = "stats_market_err";
@@ -362,26 +300,12 @@ class DB {
     static constexpr const char* KEY_LAST_TX    = "last_tx";
     static constexpr const char* KEY_LAST_RPC_OK= "last_rpc_ok";
     static constexpr const char* KEY_LAST_MKT_OK= "last_mkt_ok";
-    // FIX #3: monotonic counter of inserts since the last cleanup(), used
-    // to decide *when* to run cleanup. getTotalProcessed() (current row
-    // count) is the wrong signal for this: once cleanup() trims the table
-    // down to KEEP_LAST_TX rows, the row count keeps oscillating around
-    // KEEP_LAST_TX and re-crosses a CLEANUP_TRIGGER-aligned boundary every
-    // (CLEANUP_TRIGGER - (current_count % CLEANUP_TRIGGER)) inserts instead
-    // of every CLEANUP_TRIGGER inserts — i.e. cleanup ends up firing about
-    // twice as often as the constant's name promises. This counter is
-    // reset to 0 every time cleanup() runs, independent of row count.
     static constexpr const char* KEY_INSERTS_SINCE_CLEANUP = "inserts_since_cleanup";
 
 public:
     ~DB() { if (db_) sqlite3_close(db_); }
 
     bool open(const std::string& path) {
-        // NOTE: open() is called once from main() before any other thread
-        // (worker threads, MaintenanceThread) exists, so it is safe to call
-        // execUnlocked() here without explicitly taking mtx_ — there is no
-        // concurrent access yet. Every other caller of execUnlocked() in
-        // this class takes the lock first; see the comment on execUnlocked.
         if (sqlite3_open(path.c_str(), &db_) != SQLITE_OK) {
             LOG_ERR(std::string("SQLite open fail: ") + sqlite3_errmsg(db_));
             return false;
@@ -389,44 +313,44 @@ public:
         execUnlocked("PRAGMA journal_mode=WAL;");
         execUnlocked("PRAGMA synchronous=NORMAL;");
         execUnlocked("PRAGMA busy_timeout=5000;");
-        // INCREMENTAL auto_vacuum — не блокирует БД как обычный VACUUM
         execUnlocked("PRAGMA auto_vacuum=INCREMENTAL;");
 
-        // FIX #7: added a `status` column (0=queued, 1=done) so a process
-        // crash between claiming a tx and finishing its processing doesn't
-        // permanently lose that tx. Previously, tryClaim() inserting a row
-        // was treated as "fully processed" — if the process crashed after
-        // claim but before the worker published the report, the row already
-        // existed on restart, so tryClaim() on redelivery would return false
-        // and that whale alert would silently never be published, ever.
         execUnlocked("CREATE TABLE IF NOT EXISTS processed_tx("
-             "  tx_hash TEXT PRIMARY KEY,"
-             "  ts INTEGER NOT NULL,"
-             "  status INTEGER NOT NULL DEFAULT 0"
-             ");");
+                     "  tx_hash TEXT PRIMARY KEY,"
+                     "  ts INTEGER NOT NULL,"
+                     "  status INTEGER NOT NULL DEFAULT 0,"
+                     "  retry_count INTEGER NOT NULL DEFAULT 0,"
+                     "  parsed_json TEXT"
+                     ");");
         execUnlocked("CREATE INDEX IF NOT EXISTS idx_tx_ts ON processed_tx(ts);");
         execUnlocked("CREATE INDEX IF NOT EXISTS idx_tx_status ON processed_tx(status);");
+        // Composite index for cleanup queries (status, ts)
+        execUnlocked("CREATE INDEX IF NOT EXISTS idx_processed_status_ts ON processed_tx(status, ts);");
         execUnlocked("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);");
-        // Migration for DBs created before the status column existed: such
-        // a DB has no status column at all (ALTER TABLE ADD COLUMN below is
-        // a no-op if it already exists, since IF NOT EXISTS isn't supported
-        // for columns pre-3.35 we guard with a pragma check instead).
+
         migrateAddStatusColumnIfMissing();
+        migrateAddRetryCountColumnIfMissing();
+        migrateAddParsedJsonColumnIfMissing();
 
-        // FIX #6: `PRAGMA auto_vacuum=INCREMENTAL;` only takes effect on a
-        // brand-new (empty) database file. On a pre-existing DB created
-        // before this setting existed, SQLite silently ignores the PRAGMA
-        // unless followed by a full VACUUM — so a user upgrading from an
-        // older version of this bot could be running with auto_vacuum
-        // still set to NONE, and incremental_vacuum calls in cleanup() /
-        // maintenance() would then be no-ops. Detect and log this instead
-        // of assuming the PRAGMA above worked.
+        if (!checkIntegrity()) {
+            LOG_WARN("SQLite integrity check failed! The database file may be corrupted.");
+        }
         checkAutoVacuumMode();
-
         return true;
     }
 
-    // Ping через существующее соединение (без открытия нового)
+    bool checkIntegrity() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        sqlite3_stmt* s;        if (sqlite3_prepare_v2(db_, "PRAGMA integrity_check;", -1, &s, nullptr) != SQLITE_OK) return false;
+        bool ok = false;
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            const char* v = (const char*)sqlite3_column_text(s, 0);
+            ok = (v && std::string(v) == "ok");
+        }
+        sqlite3_finalize(s);
+        return ok;
+    }
+
     bool ping() const {
         std::lock_guard<std::mutex> lk(mtx_);
         sqlite3_stmt* s;
@@ -436,62 +360,21 @@ public:
         return ok;
     }
 
-    bool exists(const std::string& tx) const {
+    bool tryClaim(const std::string& tx, const ParsedMsg& p) {
         std::lock_guard<std::mutex> lk(mtx_);
         sqlite3_stmt* s;
-        if (sqlite3_prepare_v2(db_, "SELECT 1 FROM processed_tx WHERE tx_hash=?", -1, &s, nullptr) != SQLITE_OK) return false;
-        sqlite3_bind_text(s, 1, tx.c_str(), -1, SQLITE_STATIC);
-        bool r = sqlite3_step(s) == SQLITE_ROW;
-        sqlite3_finalize(s);
-        return r;
-    }
-
-    bool insert(const std::string& tx) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        sqlite3_stmt* s;
-        if (sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO processed_tx(tx_hash,ts) VALUES(?,?)", -1, &s, nullptr) != SQLITE_OK) return false;
+        std::string sql = "INSERT OR IGNORE INTO processed_tx(tx_hash,ts,status,retry_count,parsed_json) VALUES(?,?,0,0,?)";
+        if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &s, nullptr) != SQLITE_OK) return false;
         sqlite3_bind_text(s, 1, tx.c_str(), -1, SQLITE_STATIC);
         sqlite3_bind_int64(s, 2, std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::system_clock::now().time_since_epoch()).count());
-        bool ok = sqlite3_step(s) == SQLITE_DONE;
-        sqlite3_finalize(s);
-        return ok;
-    }
-
-    // FIX #4: with multiple worker threads now pulling from a shared queue
-    // (see WorkerPool below), the old pattern of
-    //   if (!db.exists(tx)) { ...process... db.insert(tx); }
-    // has a TOCTOU race: two workers can both see exists()==false for the
-    // same tx before either calls insert(), and both will fully process
-    // and publish a duplicate report. tryClaim() closes that gap by doing
-    // the existence check and the insert as a single atomic operation
-    // under one lock, using sqlite3_changes() to tell a fresh insert
-    // (we own this tx, proceed) apart from a no-op INSERT OR IGNORE
-    // (someone already claimed it, skip). Call this BEFORE processing,
-    // not after.
-    bool tryClaim(const std::string& tx) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        sqlite3_stmt* s;
-        // FIX #7: status defaults to 0 (queued) on insert. The row now
-        // means "claimed, not yet confirmed published" rather than "fully
-        // processed" — markDone() below is what actually finalizes it.
-        if (sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO processed_tx(tx_hash,ts,status) VALUES(?,?,0)", -1, &s, nullptr) != SQLITE_OK) return false;
-        sqlite3_bind_text(s, 1, tx.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int64(s, 2, std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+        std::string jStr = pToJson(p).dump();
+        sqlite3_bind_text(s, 3, jStr.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(s);
         sqlite3_finalize(s);
-        // sqlite3_changes() reflects the most recently completed INSERT/
-        // UPDATE/DELETE on this connection. Since DB serializes all access
-        // through mtx_, no other statement can run between our INSERT and
-        // this call, so the count is guaranteed to reflect our own statement.
         return sqlite3_changes(db_) > 0;
     }
 
-    // FIX #7: marks a tx as fully processed (report published, or worker
-    // decided not to publish due to a terminal classification result).
-    // Call this at the very end of the worker's processing pipeline, after
-    // sendMessage() has been attempted — not before.
     void markDone(const std::string& tx) {
         std::lock_guard<std::mutex> lk(mtx_);
         sqlite3_stmt* s;
@@ -501,72 +384,113 @@ public:
         sqlite3_finalize(s);
     }
 
-    // FIX #10: extended for periodic use, not just at startup. Originally
-    // this returned *every* status=0 row unconditionally, which only made
-    // sense as a one-time "previous run crashed" recovery step. A worker
-    // can also get stuck mid-task without the process dying at all — e.g.
-    // hung inside a TLS handshake or a DNS lookup that never times out at
-    // the OS level — and in that case the in-memory task is still "owned"
-    // by a live worker, so unconditionally reclaiming it here while the
-    // process is still running would race that worker. maxAgeSeconds adds
-    // a TTL: only rows claimed more than maxAgeSeconds ago are eligible.
-    // Call this once at startup with a generous/zero TTL (anything still
-    // queued from a previous run is definitely stale), and periodically
-    // from a background thread during normal operation with a TTL long
-    // enough that it only fires for tasks that are actually stuck, not
-    // ones merely waiting on a slow-but-healthy RPC call.
-    //
-    // Tradeoff, same as at startup: if the original worker is alive but
-    // just very slow (not actually hung), reclaiming its task lets a
-    // second worker pick it up too, and BOTH may eventually call
-    // sendMessage() for the same tx — i.e. a possible duplicate Telegram
-    // message, not silent data loss. Pick maxAgeSeconds well above the
-    // sum of every internal HTTP timeout in the pipeline (RPC + DexScreener
-    // + GeckoTerminal + Telegram, including their own retries) so this
-    // only fires for genuinely stuck workers, not slow-but-progressing ones.
-    std::vector<std::string> reclaimStaleQueued(int64_t maxAgeSeconds = 0) {
+    std::vector<WhaleTask> reclaimAfterRestart() {
         std::lock_guard<std::mutex> lk(mtx_);
-        std::vector<std::string> out;
-        int64_t cutoff = std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count() - maxAgeSeconds;
+        std::vector<WhaleTask> out;
         sqlite3_stmt* s;
-        if (sqlite3_prepare_v2(db_, "SELECT tx_hash FROM processed_tx WHERE status=0 AND ts<=?", -1, &s, nullptr) != SQLITE_OK) return out;
-        sqlite3_bind_int64(s, 1, cutoff);
+        if (sqlite3_prepare_v2(db_, "SELECT tx_hash, parsed_json FROM processed_tx WHERE status=0", -1, &s, nullptr) != SQLITE_OK) return out;
         while (sqlite3_step(s) == SQLITE_ROW) {
-            const char* v = (const char*)sqlite3_column_text(s, 0);
-            if (v) out.push_back(v);
+            const char* v = (const char*)sqlite3_column_text(s, 0);            const char* jStr = (const char*)sqlite3_column_text(s, 1);
+            if (v) {
+                WhaleTask task;
+                task.txLower = v;
+                if (jStr) { try { task.parsed = pFromJson(json::parse(jStr)); } catch (...) {} }
+                out.push_back(std::move(task));
+            }
         }
         sqlite3_finalize(s);
         return out;
     }
 
-    void cleanup(int keep) {
+    std::vector<WhaleTask> tryRequeueStale(int64_t maxAgeSeconds, int maxAttempts) {
         std::lock_guard<std::mutex> lk(mtx_);
-        std::string sql = "DELETE FROM processed_tx WHERE rowid NOT IN ("
-                          "  SELECT rowid FROM processed_tx ORDER BY ts DESC LIMIT " +
-                          std::to_string(keep) + ")";
-        execUnlocked(sql);
-        // Incremental vacuum после удаления — освобождает место без блокировки
-        execUnlocked("PRAGMA incremental_vacuum;");
-        // FIX #3: reset the "inserts since last cleanup" counter here, in
-        // the same critical section, so the next cleanup is judged against
-        // a fresh count of *new* inserts rather than the post-cleanup row
-        // count (which would cross the trigger threshold again almost
-        // immediately and double the effective cleanup frequency).
-        setMetaUnlocked(KEY_INSERTS_SINCE_CLEANUP, "0");
-        LOG_INFO("DB cleanup: kept last " + std::to_string(keep));
+        std::vector<WhaleTask> toRequeue;
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        int64_t cutoff = now - maxAgeSeconds;
+
+        std::vector<std::tuple<std::string, int, std::string>> candidates;
+        sqlite3_stmt* s;
+        if (sqlite3_prepare_v2(db_, "SELECT tx_hash, retry_count, parsed_json FROM processed_tx WHERE status=0 AND ts<=?", -1, &s, nullptr) != SQLITE_OK) return toRequeue;
+        sqlite3_bind_int64(s, 1, cutoff);
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const char* v = (const char*)sqlite3_column_text(s, 0);
+            int retryCount = sqlite3_column_int(s, 1);
+            const char* jStr = (const char*)sqlite3_column_text(s, 2);
+            if (v) candidates.emplace_back(v, retryCount, jStr ? jStr : "");
+        }
+        sqlite3_finalize(s);
+
+        for (const auto& [txHash, retryCount, jStr] : candidates) {
+            if (retryCount >= maxAttempts) {
+                sqlite3_stmt* upd;
+                if (sqlite3_prepare_v2(db_, "UPDATE processed_tx SET status=2 WHERE tx_hash=?", -1, &upd, nullptr) == SQLITE_OK) {
+                    sqlite3_bind_text(upd, 1, txHash.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_step(upd);
+                    sqlite3_finalize(upd);
+                }
+                LOG_ERR("Abandoning tx " + txHash + " after " + std::to_string(retryCount) + " attempts");
+            } else {
+                sqlite3_stmt* upd;
+                if (sqlite3_prepare_v2(db_, "UPDATE processed_tx SET ts=?, retry_count=retry_count+1 WHERE tx_hash=?", -1, &upd, nullptr) == SQLITE_OK) {
+                    sqlite3_bind_int64(upd, 1, now);
+                    sqlite3_bind_text(upd, 2, txHash.c_str(), -1, SQLITE_STATIC);
+                    sqlite3_step(upd);
+                    sqlite3_finalize(upd);
+                }
+                WhaleTask task;
+                task.txLower = txHash;                if (!jStr.empty()) { try { task.parsed = pFromJson(json::parse(jStr)); } catch (...) {} }
+                toRequeue.push_back(std::move(task));
+            }
+        }
+        return toRequeue;
     }
 
-    // FIX #3: call this once per processed transaction instead of computing
-    // `db.getTotalProcessed() % CLEANUP_TRIGGER`. getTotalProcessed() is the
-    // *current row count*, which keeps re-crossing a trigger-aligned
-    // boundary right after every cleanup() (e.g. 500 -> 600 -> cleanup ->
-    // 500 -> 600 -> cleanup..., firing roughly every 100 inserts instead of
-    // every CLEANUP_TRIGGER=200). This method instead tracks a counter that
-    // only resets when cleanup() actually runs, so cleanup fires exactly
-    // every `trigger` new inserts regardless of how many rows cleanup()
-    // leaves behind. Increment and threshold check happen under one lock
-    // to avoid a lost-update race between concurrent callers.
+    int getAbandonedCount() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        sqlite3_stmt* s;
+        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM processed_tx WHERE status=2", -1, &s, nullptr) != SQLITE_OK) return 0;
+        int n = 0;
+        if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+        sqlite3_finalize(s);
+        return n;
+    }
+
+    int getQueuedCount() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        sqlite3_stmt* s;
+        if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM processed_tx WHERE status=0", -1, &s, nullptr) != SQLITE_OK) return 0;
+        int n = 0;
+        if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+        sqlite3_finalize(s);
+        return n;
+    }
+
+    void cleanup(int /*keep*/) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        // Delete by age
+        int64_t cutoffDone = now - (cfg::RETENTION_DAYS_DONE * 86400LL);
+        execUnlocked("DELETE FROM processed_tx WHERE status=1 AND ts < " + std::to_string(cutoffDone));
+
+        int64_t cutoffAbandoned = now - (cfg::RETENTION_DAYS_ABANDONED * 86400LL);
+        execUnlocked("DELETE FROM processed_tx WHERE status=2 AND ts < " + std::to_string(cutoffAbandoned));
+
+        // Hard cap by count
+        std::string sqlCount = "DELETE FROM processed_tx WHERE status=1 AND rowid NOT IN ("
+                               "SELECT rowid FROM processed_tx WHERE status=1 ORDER BY ts DESC LIMIT " +
+                               std::to_string(cfg::MAX_DONE_RECORDS) + ")";
+        execUnlocked(sqlCount);
+
+        execUnlocked("PRAGMA incremental_vacuum;");
+        execUnlocked("PRAGMA wal_checkpoint(PASSIVE);");
+        setMetaUnlocked(KEY_INSERTS_SINCE_CLEANUP, "0");
+        LOG_INFO("DB cleanup: deleted by age (done=" + std::to_string(cfg::RETENTION_DAYS_DONE) +
+                 "d, abandoned=" + std::to_string(cfg::RETENTION_DAYS_ABANDONED) +                 "d) and excess count (max " + std::to_string(cfg::MAX_DONE_RECORDS) + ")");
+    }
+
     bool noteInsertedAndShouldCleanup(int trigger) {
         std::lock_guard<std::mutex> lk(mtx_);
         std::string v = getMetaUnlocked(KEY_INSERTS_SINCE_CLEANUP);
@@ -576,16 +500,9 @@ public:
         return count >= trigger;
     }
 
-    void saveOffset(long offset) {
-        setMeta("offset", std::to_string(offset));
-    }
+    void saveOffset(long offset) { setMeta("offset", std::to_string(offset)); }
+    long loadOffset() const { std::string v = getMeta("offset"); return v.empty() ? 0 : std::stol(v); }
 
-    long loadOffset() const {
-        std::string v = getMeta("offset");
-        return v.empty() ? 0 : std::stol(v);
-    }
-
-    // Persistent stats
     void incMessages()   { incMeta(KEY_MESSAGES); }
     void incTxOk()       { incMeta(KEY_TX_OK); }
     void incErrors()     { incMeta(KEY_ERRORS); }
@@ -620,30 +537,23 @@ public:
         if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM processed_tx", -1, &s, nullptr) != SQLITE_OK) return 0;
         int n = 0;
         if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
-        sqlite3_finalize(s);
-        return n;
+        sqlite3_finalize(s);        return n;
     }
 
-    // Размер БД через filesystem (надёжнее чем pragma)
     int64_t getDbSizeBytes() const {
         std::error_code ec;
         auto size = fs::file_size(cfg::DB_PATH, ec);
         return ec ? 0 : size;
     }
 
-    // Maintenance: incremental vacuum (не блокирует как обычный VACUUM)
     void maintenance() {
         std::lock_guard<std::mutex> lk(mtx_);
         execUnlocked("PRAGMA incremental_vacuum;");
-        LOG_INFO("DB maintenance (incremental_vacuum) completed");
+        execUnlocked("PRAGMA wal_checkpoint(TRUNCATE);");
+        LOG_INFO("DB maintenance completed");
     }
 
 private:
-    // FIX #2/#3: split into an Unlocked core (assumes caller already holds
-    // mtx_) plus locked public-facing wrappers. This mirrors execUnlocked's
-    // invariant: Unlocked variants must NEVER take mtx_ themselves, since
-    // cleanup() and noteInsertedAndShouldCleanup() call them while already
-    // holding the lock, and std::mutex is not recursive.
     std::string getMetaUnlocked(const std::string& key) const {
         sqlite3_stmt* s;
         if (sqlite3_prepare_v2(db_, "SELECT value FROM meta WHERE key=?", -1, &s, nullptr) != SQLITE_OK) return "";
@@ -677,93 +587,67 @@ private:
         sqlite3_step(s);
         sqlite3_finalize(s);
     }
-
-    // Locked public-facing wrappers — safe to call from outside the class
-    // when mtx_ is NOT already held.
     std::string getMeta(const std::string& key) const {
         std::lock_guard<std::mutex> lk(mtx_);
         return getMetaUnlocked(key);
     }
-
     void setMeta(const std::string& key, const std::string& value) {
         std::lock_guard<std::mutex> lk(mtx_);
         setMetaUnlocked(key, value);
     }
-
     void incMeta(const std::string& key) {
         std::lock_guard<std::mutex> lk(mtx_);
         incMetaUnlocked(key);
     }
-
     uint64_t getMetaU64(const std::string& key) const {
         std::string v = getMeta(key);
         return v.empty() ? 0 : std::stoull(v);
     }
 
-    // FIX #7: DBs created before the `status` column existed (i.e. before
-    // this version of the bot) won't have it — execUnlocked()'s
-    // CREATE TABLE IF NOT EXISTS is a no-op on an existing table and does
-    // NOT retroactively add new columns. Without this migration, every
-    // tryClaim()/markDone()/reclaimStaleQueued() call would fail with a
-    // "no such column: status" SQL error on an upgraded (pre-existing) DB
-    // file. PRAGMA table_info lets us check for the column's existence
-    // before trying to add it, since SQLite has no
-    // "ALTER TABLE ... ADD COLUMN IF NOT EXISTS" syntax.
     void migrateAddStatusColumnIfMissing() {
         sqlite3_stmt* s;
-        if (sqlite3_prepare_v2(db_, "PRAGMA table_info(processed_tx);", -1, &s, nullptr) != SQLITE_OK) {
-            LOG_WARN("Could not inspect processed_tx schema for migration");
-            return;
-        }
+        if (sqlite3_prepare_v2(db_, "PRAGMA table_info(processed_tx);", -1, &s, nullptr) != SQLITE_OK) return;
         bool hasStatus = false;
         while (sqlite3_step(s) == SQLITE_ROW) {
-            const char* colName = (const char*)sqlite3_column_text(s, 1); // column 1 = "name"
-            if (colName && std::string(colName) == "status") { hasStatus = true; break; }
+            const char* c = (const char*)sqlite3_column_text(s, 1);
+            if (c && std::string(c) == "status") { hasStatus = true; break; }
         }
         sqlite3_finalize(s);
-
-        if (!hasStatus) {
-            LOG_INFO("Migrating processed_tx: adding status column (pre-existing DB)");
-            // Existing rows predate the queued/done distinction entirely —
-            // they were inserted by the old insert()-after-processing flow,
-            // so they represent transactions that were already fully
-            // handled. Default them to status=1 (done) rather than 0
-            // (queued), or reclaimStaleQueued() would re-publish every
-            // historical whale alert on the first startup after upgrading.
-            execUnlocked("ALTER TABLE processed_tx ADD COLUMN status INTEGER NOT NULL DEFAULT 1;");
-        }
+        if (!hasStatus) execUnlocked("ALTER TABLE processed_tx ADD COLUMN status INTEGER NOT NULL DEFAULT 1;");
     }
 
-    // FIX #6: query the *actual* auto_vacuum mode SQLite is using (0=NONE,
-    // 1=FULL, 2=INCREMENTAL) and log a clear warning if it didn't take
-    // effect, instead of silently assuming incremental_vacuum will work.
+    void migrateAddRetryCountColumnIfMissing() {
+        sqlite3_stmt* s;
+        if (sqlite3_prepare_v2(db_, "PRAGMA table_info(processed_tx);", -1, &s, nullptr) != SQLITE_OK) return;
+        bool hasCol = false;
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const char* c = (const char*)sqlite3_column_text(s, 1);
+            if (c && std::string(c) == "retry_count") { hasCol = true; break; }
+        }
+        sqlite3_finalize(s);
+        if (!hasCol) execUnlocked("ALTER TABLE processed_tx ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;");
+    }
+
+    void migrateAddParsedJsonColumnIfMissing() {
+        sqlite3_stmt* s;
+        if (sqlite3_prepare_v2(db_, "PRAGMA table_info(processed_tx);", -1, &s, nullptr) != SQLITE_OK) return;
+        bool hasCol = false;
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const char* c = (const char*)sqlite3_column_text(s, 1);
+            if (c && std::string(c) == "parsed_json") { hasCol = true; break; }
+        }        sqlite3_finalize(s);
+        if (!hasCol) execUnlocked("ALTER TABLE processed_tx ADD COLUMN parsed_json TEXT;");
+    }
+
     void checkAutoVacuumMode() {
         sqlite3_stmt* s;
-        if (sqlite3_prepare_v2(db_, "PRAGMA auto_vacuum;", -1, &s, nullptr) != SQLITE_OK) {
-            LOG_WARN("Could not query auto_vacuum mode");
-            return;
-        }
+        if (sqlite3_prepare_v2(db_, "PRAGMA auto_vacuum;", -1, &s, nullptr) != SQLITE_OK) return;
         int mode = -1;
         if (sqlite3_step(s) == SQLITE_ROW) mode = sqlite3_column_int(s, 0);
         sqlite3_finalize(s);
-
-        if (mode == 2) {
-            LOG_INFO("auto_vacuum=INCREMENTAL confirmed active");
-        } else {
-            LOG_WARN("auto_vacuum is NOT incremental (mode=" + std::to_string(mode) +
-                      "). This likely means the DB file pre-dates this PRAGMA. "
-                      "incremental_vacuum calls will be no-ops until a one-time "
-                      "`VACUUM;` is run manually on this DB file to apply the new mode.");
-        }
+        if (mode != 2) LOG_WARN("auto_vacuum is NOT incremental (mode=" + std::to_string(mode) + ")");
     }
 
-    // FIX #2: renamed exec() -> execUnlocked() and documented the invariant
-    // explicitly. This function must NEVER acquire mtx_ itself: every
-    // caller (open(), cleanup(), maintenance(), and friends) already holds
-    // mtx_ when calling it. If a future refactor added locking inside this
-    // function, every existing call site would self-deadlock instantly
-    // since std::mutex is not recursive. Keep this raw and let callers own
-    // the lock.
     void execUnlocked(const std::string& sql) {
         char* err = nullptr;
         sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err);
@@ -772,12 +656,11 @@ private:
 };
 
 // ============================================================================
-//  BOT STATS (atomic + persistent)
+//  BOT STATS
 // ============================================================================
 struct BotStats {
     std::chrono::system_clock::time_point startTime;
 
-    // Atomic для потокобезопасности
     std::atomic<uint64_t> totalMessagesReceived{0};
     std::atomic<uint64_t> totalTxProcessed{0};
     std::atomic<uint64_t> totalErrors{0};
@@ -785,22 +668,23 @@ struct BotStats {
     std::atomic<uint64_t> marketErrors{0};
     std::atomic<uint64_t> telegramErrors{0};
 
-    // Runtime-only info (не персистентное)
     std::atomic<int64_t> lastRpcOkTs{0};
     std::atomic<int64_t> lastMktOkTs{0};
+
     std::string lastTx;
-    std::string currentRpc;
     std::mutex lastTxMtx;
 
-    // Загрузка из persistent storage
+    std::atomic<uint64_t> activeWorkers{0};
+    std::atomic<uint64_t> replacementWorkersStarted{0};
+    std::atomic<uint64_t> hungWorkersDetected{0};
+
     void loadFromDb(const DB& db) {
         totalMessagesReceived.store(db.getMessages());
         totalTxProcessed.store(db.getTxOk());
         totalErrors.store(db.getErrors());
         rpcErrors.store(db.getRpcErr());
         marketErrors.store(db.getMarketErr());
-        telegramErrors.store(db.getTgErr());
-        lastRpcOkTs.store(db.getLastRpcOk());
+        telegramErrors.store(db.getTgErr());        lastRpcOkTs.store(db.getLastRpcOk());
         lastMktOkTs.store(db.getLastMktOk());
         lastTx = db.getLastTx();
     }
@@ -816,24 +700,90 @@ struct BotStats {
 };
 
 // ============================================================================
-//  BSC RPC (с ротацией)
+//  BSC RPC (with per-node stats and circuit breaker)
 // ============================================================================
+struct RpcNodeStats {
+    std::string url;
+    std::atomic<uint64_t> ok{0};
+    std::atomic<uint64_t> fail{0};
+    std::atomic<int64_t> lastSuccess{0};
+    std::atomic<int> consecutiveFailures{0};
+    std::atomic<int64_t> disabledUntil{0};
+
+    explicit RpcNodeStats(const std::string& u) : url(u) {}
+
+    double successRate() const {
+        uint64_t total = ok.load() + fail.load();
+        if (total == 0) return 100.0;
+        return (double)ok.load() / total * 100.0;
+    }
+
+    bool isDisabled() const {
+        int64_t until = disabledUntil.load();
+        if (until == 0) return false;
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return now < until;
+    }
+
+    void recordSuccess() {
+        ok.fetch_add(1);
+        consecutiveFailures.store(0);
+        lastSuccess.store(std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    void recordFailure() {        fail.fetch_add(1);
+        int fails = consecutiveFailures.fetch_add(1) + 1;
+        if (fails >= cfg::RPC_CIRCUIT_FAILURE_THRESHOLD) {
+            int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            disabledUntil.store(now + cfg::RPC_CIRCUIT_DISABLE_SECONDS);
+            LOG_WARN("RPC " + url + " disabled for " +
+                     std::to_string(cfg::RPC_CIRCUIT_DISABLE_SECONDS) +
+                     "s after " + std::to_string(fails) + " consecutive failures");
+        }
+    }
+};
+
 class BscRpc {
-    size_t idx_ = 0;
-    mutable std::mutex mtx_;
+    std::vector<std::shared_ptr<RpcNodeStats>> nodes_;
+    std::atomic<size_t> lastUsedIdx_{0};
+
 public:
+    BscRpc() {
+        for (const auto& url : cfg::BSC_RPC) {
+            nodes_.push_back(std::make_shared<RpcNodeStats>(url));
+        }
+    }
+
     bool call(const std::string& method, const json& params, json& result) {
-        std::lock_guard<std::mutex> lk(mtx_);
-        for (size_t attempt = 0; attempt < cfg::BSC_RPC.size(); ++attempt) {
-            const std::string& url = cfg::BSC_RPC[(idx_ + attempt) % cfg::BSC_RPC.size()];
+        // fetch_add ensures each worker starts from different RPC
+        size_t start = lastUsedIdx_.fetch_add(1, std::memory_order_relaxed);
+
+        for (size_t attempt = 0; attempt < nodes_.size(); ++attempt) {
+            size_t idx = (start + attempt) % nodes_.size();
+            auto& node = nodes_[idx];
+
+            if (node->isDisabled()) continue;
+
             json req = {{"jsonrpc","2.0"},{"id",1},{"method",method},{"params",params}};
-            auto resp = Http::post(url, req);
-            if (resp.ok() && resp.parsed.contains("result") && !resp.parsed["result"].is_null()) {
-                result = resp.parsed["result"];
-                idx_ = (idx_ + attempt) % cfg::BSC_RPC.size();
-                return true;
+            auto resp = Http::post(node->url, req);
+
+            if (resp.ok() && resp.parsed.contains("result")) {
+                if (!resp.parsed["result"].is_null()) {
+                    node->recordSuccess();
+                    result = resp.parsed["result"];
+                    return true;
+                } else {
+                    // result=null is NOT an RPC error (TX may not be indexed yet)
+                    LOG_INFO("RPC returned null result (TX may not be indexed yet): " + node->url);
+                    continue;
+                }
             }
-            LOG_WARN("RPC fail: " + url + " method=" + method);
+
+            node->recordFailure();            LOG_WARN("RPC error: " + node->url + " method=" + method +
+                     " status=" + std::to_string(resp.status));
         }
         return false;
     }
@@ -845,21 +795,43 @@ public:
         return call("eth_getTransactionReceipt", {hash}, out);
     }
 
-    // FIX #1: previously read idx_ without holding mtx_, which is a real
-    // data race (UB under the C++ memory model) against the write in
-    // call(). Now properly synchronized via the same mutex.
     std::string getCurrentRpc() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return cfg::BSC_RPC[idx_ % cfg::BSC_RPC.size()];
+        size_t idx = lastUsedIdx_.load() % nodes_.size();
+        return nodes_[idx]->url;
+    }
+
+    std::vector<std::pair<std::string, double>> getRpcStats() const {
+        std::vector<std::pair<std::string, double>> stats;
+        for (const auto& node : nodes_) {
+            stats.emplace_back(node->url, node->successRate());
+        }
+        return stats;
+    }
+
+    void logRpcStats() const {
+        auto stats = getRpcStats();
+        bool hasProblems = false;
+        std::ostringstream log;
+        log << "RPC health check:";
+        for (const auto& [url, rate] : stats) {
+            if (rate < 95.0) {
+                hasProblems = true;
+                log << "\n  ⚠️ " << url << " = " << std::fixed << std::setprecision(1) << rate << "%";
+            }
+        }
+        if (hasProblems) {
+            LOG_WARN(log.str());
+        } else {
+            LOG_INFO("All RPC nodes healthy (>95% success rate)");
+        }
     }
 };
 
 // ============================================================================
-//  TX CLASSIFIER (консервативный, через stablecoins)
+//  CLASSIFIER & PARSER
 // ============================================================================
 struct TxInfo {
-    std::string type;
-    std::string tokenAddr;
+    std::string type;    std::string tokenAddr;
     std::string from;
     std::string to;
 };
@@ -869,15 +841,19 @@ namespace classifier {
 const std::string TRANSFER_TOPIC =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
+inline unsigned char toLowerChar(unsigned char c) {
+    return static_cast<unsigned char>(std::tolower(c));
+}
+
 std::string padAddr(const std::string& hex) {
     if (hex.size() < 40) return "";
     std::string tail = hex.substr(hex.size() - 40);
-    std::transform(tail.begin(), tail.end(), tail.begin(), ::tolower);
+    std::transform(tail.begin(), tail.end(), tail.begin(), toLowerChar);
     return "0x" + tail;
 }
 
 std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    std::transform(s.begin(), s.end(), s.begin(), toLowerChar);
     return s;
 }
 
@@ -896,11 +872,8 @@ TxInfo classify(const json& tx, const json& receipt, const std::string& whaleAdd
     std::string whale = toLower(whaleAddr);
 
     json logs = receipt.value("logs", json::array());
-
-    bool whaleSentStable = false;
-    bool whaleGotStable = false;
-    bool whaleSentToken = false;
-    bool whaleGotToken = false;
+    bool whaleSentStable = false, whaleGotStable = false;
+    bool whaleSentToken = false, whaleGotToken = false;
     std::string tokenContract;
 
     for (const auto& log : logs) {
@@ -908,11 +881,9 @@ TxInfo classify(const json& tx, const json& receipt, const std::string& whaleAdd
         if (topics.size() < 3) continue;
         std::string topic0 = toLower(topics[0].get<std::string>());
         if (topic0 != TRANSFER_TOPIC) continue;
-
         std::string from = padAddr(topics[1].get<std::string>());
         std::string to   = padAddr(topics[2].get<std::string>());
         std::string contract = toLower(log.value("address", ""));
-
         bool isStable = isStablecoin(contract);
         bool fromWhale = (from == whale);
         bool toWhale = (to == whale);
@@ -934,34 +905,16 @@ TxInfo classify(const json& tx, const json& receipt, const std::string& whaleAdd
 
     info.tokenAddr = tokenContract;
 
-    if (whaleSentStable && whaleGotToken) {
-        info.type = "BUY";
-    } else if (whaleSentToken && whaleGotStable) {
-        info.type = "SELL";
-    } else if (whaleSentToken && !whaleGotToken && !whaleSentStable && !whaleGotStable) {
-        info.type = "SEND";
-    } else if (whaleGotToken && !whaleSentToken && !whaleSentStable && !whaleGotStable) {
-        info.type = "RECEIVE";
-    } else {
-        info.type = "UNKNOWN";
-    }
+    if (whaleSentStable && whaleGotToken) info.type = "BUY";
+    else if (whaleSentToken && whaleGotStable) info.type = "SELL";
+    else if (whaleSentToken && !whaleGotToken && !whaleSentStable && !whaleGotStable) info.type = "SEND";
+    else if (whaleGotToken && !whaleSentToken && !whaleSentStable && !whaleGotStable) info.type = "RECEIVE";
+    else info.type = "UNKNOWN";
 
     return info;
 }
-} // namespace classifier
 
-// ============================================================================
-//  MESSAGE PARSER (с точными regex)
-// ============================================================================
-struct ParsedMsg {
-    std::string whaleName;
-    std::string txHash;
-    std::string contract;
-    std::string coin;
-    std::string amount;
-    std::string quantity;
-    std::string whaleAddr;
-};
+} // namespace classifier
 
 ParsedMsg parseMessage(const std::string& text) {
     ParsedMsg p;
@@ -976,36 +929,29 @@ ParsedMsg parseMessage(const std::string& text) {
         }
     }
 
-    auto extractHex = [&](const std::string& key, int len) -> std::string {
-        std::regex re(key + R"(\s*[:：]\s*(0x[0-9a-fA-F]{)" + std::to_string(len) + R"(}))");
+    static const std::regex TX_HASH_RE(R"((?:TX|Хеш|Hash)\s*[:：]\s*(0x[0-9a-fA-F]{64}))");    static const std::regex CONTRACT_RE(R"((?:Контракт|Contract)\s*[:：]\s*(0x[0-9a-fA-F]{40}))");
+    static const std::regex COIN_RE(R"(🪙\s*([A-Za-z0-9]+))");
+    static const std::regex AMOUNT_RE(R"([💰\$]\s*\$?([0-9]+[.,]?[0-9]*[kKmMbB]?))");
+    static const std::regex QUANTITY_RE(R"(🔢\s*([0-9]+[.,]?[0-9]*[kKmMbB]?))");
+    static const std::regex WHALE_ADDR_RE(R"(👤\s*(0x[0-9a-fA-F]{40}))");
+    static const std::regex TX_HASH_FALLBACK_RE(R"((0x[0-9a-fA-F]{64}))");
+    static const std::regex CONTRACT_FALLBACK_RE(R"((0x[0-9a-fA-F]{40}))");
+
+    auto extractFirst = [&](const std::regex& re) -> std::string {
         std::smatch m;
         if (std::regex_search(text, m, re)) return m[1].str();
         return "";
     };
 
-    p.txHash   = extractHex("TX|Хеш|Hash", 64);
-    p.contract = extractHex("Контракт|Contract", 40);
+    p.txHash = extractFirst(TX_HASH_RE);
+    if (p.txHash.empty()) p.txHash = extractFirst(TX_HASH_FALLBACK_RE);
+    p.contract = extractFirst(CONTRACT_RE);
+    if (p.contract.empty()) p.contract = extractFirst(CONTRACT_FALLBACK_RE);
+    p.coin = extractFirst(COIN_RE);
+    p.amount = extractFirst(AMOUNT_RE);
+    p.quantity = extractFirst(QUANTITY_RE);
+    p.whaleAddr = extractFirst(WHALE_ADDR_RE);
 
-    {
-        std::regex re(R"(🪙\s*([A-Za-z0-9]+))");
-        std::smatch m;
-        if (std::regex_search(text, m, re)) p.coin = m[1].str();
-    }
-    {
-        std::regex re(R"([💰\$]\s*\$?([0-9]+[.,]?[0-9]*[kKmMbB]?))");
-        std::smatch m;
-        if (std::regex_search(text, m, re)) p.amount = m[1].str();
-    }
-    {
-        std::regex re(R"(🔢\s*([0-9]+[.,]?[0-9]*[kKmMbB]?))");
-        std::smatch m;
-        if (std::regex_search(text, m, re)) p.quantity = m[1].str();
-    }
-    {
-        std::regex re(R"(👤\s*(0x[0-9a-fA-F]{40}))");
-        std::smatch m;
-        if (std::regex_search(text, m, re)) p.whaleAddr = m[1].str();
-    }
     return p;
 }
 
@@ -1028,36 +974,59 @@ struct MarketData {
 };
 
 bool findOhlcvList(const json& j, json& out) {
-    if (j.contains("ohlcv_list")) {
-        out = j["ohlcv_list"];
-        return true;
-    }
+    if (j.contains("ohlcv_list")) { out = j["ohlcv_list"]; return true; }
     if (j.is_object()) {
-        for (auto it = j.begin(); it != j.end(); ++it) {
+        for (auto it = j.begin(); it != j.end(); ++it)
             if (findOhlcvList(it.value(), out)) return true;
-        }
-    }
-    if (j.is_array()) {
-        for (const auto& item : j) {
+    }    if (j.is_array()) {
+        for (const auto& item : j)
             if (findOhlcvList(item, out)) return true;
-        }
     }
     return false;
 }
 
 class MarketAggregator {
+    std::mutex mtx_;
+    std::deque<int64_t> failureTimestamps_;
+
+    bool isCircuitOpen() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        int64_t cutoff = now - cfg::MARKET_CIRCUIT_WINDOW_SEC;
+        while (!failureTimestamps_.empty() && failureTimestamps_.front() < cutoff) {
+            failureTimestamps_.pop_front();
+        }
+        return (int)failureTimestamps_.size() >= cfg::MARKET_CIRCUIT_THRESHOLD;
+    }
+
+    void recordFailure() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        failureTimestamps_.push_back(now);
+        // Don't clear on success — let window naturally expire
+    }
+
 public:
     MarketData fetch(const std::string& contract) {
         MarketData md;
-        std::string c = classifier::toLower(contract);
 
+        if (isCircuitOpen()) {
+            LOG_WARN("Market data circuit breaker OPEN, skipping fetch for " + contract);
+            md.ok = false;
+            md.source = "CIRCUIT_BREAKER";
+            return md;
+        }
+
+        std::string c = classifier::toLower(contract);
         if (tryDexScreener(c, md)) return md;
         LOG_WARN("DexScreener fail, fallback to GeckoTerminal");
         if (tryGeckoTerminal(c, md)) return md;
         LOG_WARN("GeckoTerminal fail, Market Data unavailable");
+        recordFailure();
         return md;
     }
-
 private:
     bool tryDexScreener(const std::string& contract, MarketData& md) {
         auto resp = Http::get(cfg::DEXSCREENER_BASE + "/latest/dex/tokens/" + contract);
@@ -1080,10 +1049,7 @@ private:
         md.liquidityUsd = bestLiq;
         md.symbol = best.value("baseToken", json::object()).value("symbol", "");
         md.pairAddress = best.value("pairAddress", "");
-
-        if (!md.pairAddress.empty()) {
-            fetchOhlcvGecko(md.pairAddress, md.candles1m);
-        }
+        if (!md.pairAddress.empty()) fetchOhlcvGecko(md.pairAddress, md.candles1m);
         return true;
     }
 
@@ -1103,7 +1069,6 @@ private:
         } catch (...) { return false; }
 
         md.pairAddress = data[0].value("id", "");
-
         auto rel = resp.parsed.value("included", json::array());
         for (const auto& r : rel) {
             if (r.value("type","") == "token") {
@@ -1111,7 +1076,6 @@ private:
                 break;
             }
         }
-
         std::string addr = md.pairAddress;
         if (addr.rfind("bsc_", 0) == 0) addr = addr.substr(4);
         fetchOhlcvGecko(addr, md.candles1m);
@@ -1161,8 +1125,7 @@ double rsi(const std::vector<OhlcvCandle>& candles, int period) {
     double avgLoss = loss / period;
     for (size_t i = period + 1; i < candles.size(); ++i) {
         double d = candles[i].close - candles[i-1].close;
-        double g = d > 0 ? d : 0;
-        double l = d < 0 ? -d : 0;
+        double g = d > 0 ? d : 0;        double l = d < 0 ? -d : 0;
         avgGain = (avgGain * (period - 1) + g) / period;
         avgLoss = (avgLoss * (period - 1) + l) / period;
     }
@@ -1171,19 +1134,9 @@ double rsi(const std::vector<OhlcvCandle>& candles, int period) {
     return 100.0 - 100.0 / (1.0 + rs);
 }
 
-// FIX #5: stochRsi() used to call rsi() from scratch on a growing prefix
-// of `candles` for every one of the ~stochPeriod windows it needed,
-// recomputing the Wilder-smoothed average gain/loss from the very first
-// candle each time. That's O(rsiPeriod * stochPeriod) work, repeated on
-// every report. This helper builds the *entire* Wilder-smoothed RSI series
-// in a single O(n) pass — each RSI value is derived incrementally from the
-// previous one, exactly like rsi() does internally, but only once per
-// candle instead of once per window. stochRsi() below now just reads the
-// already-computed series instead of recomputing it.
 std::vector<double> rsiSeriesAll(const std::vector<OhlcvCandle>& candles, int period) {
     std::vector<double> out;
     if ((int)candles.size() < period + 1) return out;
-
     double gain = 0, loss = 0;
     for (int i = 1; i <= period; ++i) {
         double d = candles[i].close - candles[i-1].close;
@@ -1196,8 +1149,7 @@ std::vector<double> rsiSeriesAll(const std::vector<OhlcvCandle>& candles, int pe
         double rs = ag / al;
         return 100.0 - 100.0 / (1.0 + rs);
     };
-    out.push_back(rsiFromAvgs(avgGain, avgLoss));  // RSI as of candle index `period`
-
+    out.push_back(rsiFromAvgs(avgGain, avgLoss));
     for (size_t i = period + 1; i < candles.size(); ++i) {
         double d = candles[i].close - candles[i-1].close;
         double g = d > 0 ? d : 0;
@@ -1210,8 +1162,7 @@ std::vector<double> rsiSeriesAll(const std::vector<OhlcvCandle>& candles, int pe
 }
 
 double stochRsi(const std::vector<OhlcvCandle>& candles, int rsiPeriod = 14, int stochPeriod = 14) {
-    int need = rsiPeriod + stochPeriod;
-    if ((int)candles.size() < need) return NAN;
+    if ((int)candles.size() < rsiPeriod + stochPeriod) return NAN;
     std::vector<double> rsiSeries = rsiSeriesAll(candles, rsiPeriod);
     if ((int)rsiSeries.size() < stochPeriod) return NAN;
     double mn = *std::min_element(rsiSeries.end() - stochPeriod, rsiSeries.end());
@@ -1223,8 +1174,7 @@ double stochRsi(const std::vector<OhlcvCandle>& candles, int rsiPeriod = 14, int
 
 double sumVolume(const std::vector<OhlcvCandle>& candles, int n) {
     if ((int)candles.size() < n) return 0;
-    double sum = 0;
-    for (int i = (int)candles.size() - n; i < (int)candles.size(); ++i) {
+    double sum = 0;    for (int i = (int)candles.size() - n; i < (int)candles.size(); ++i) {
         sum += candles[i].volume;
     }
     return sum;
@@ -1238,6 +1188,7 @@ std::string rsiColor(double v) {
     if (v < 80) return "🟢";
     return "🔵";
 }
+
 std::string stochColor(double v) {
     if (std::isnan(v)) return "⚪";
     if (v < 0.10) return "🔴";
@@ -1246,6 +1197,7 @@ std::string stochColor(double v) {
     if (v < 0.90) return "🟢";
     return "🔵";
 }
+
 std::string volColor(double pct) {
     if (pct < 50)  return "🔴";
     if (pct < 100) return "🟠";
@@ -1253,6 +1205,7 @@ std::string volColor(double pct) {
     if (pct < 300) return "🟢";
     return "🔵";
 }
+
 std::string liqColor(double usd) {
     if (usd < 20000)   return "🔴";
     if (usd < 50000)   return "🟠";
@@ -1271,28 +1224,36 @@ std::string fmtNum(double v) {
 }
 
 } // namespace ind
-
 // ============================================================================
-//  TELEGRAM BOT (с командами и правильной обработкой 429)
+//  TELEGRAM BOT
 // ============================================================================
 class TgBot {
     std::string token_;
     std::string apiBase_;
-    // FIX #12 (review point #4): timestamp of the last /health invocation,
-    // so a fat-fingered or scripted loop of /health calls can't hammer
-    // Telegram getMe + DexScreener + GeckoTerminal + a BSC RPC node on
-    // every single message. Plain int64_t is fine here: handleCommand() is
-    // only ever called from the single-threaded poller loop, never from a
-    // worker thread, so there's no concurrent access to guard against.
     int64_t lastHealthCheckTs_ = 0;
+    int64_t botId_ = 0;
+
 public:
     TgBot(const std::string& token)
-        : token_(token), apiBase_("https://api.telegram.org/bot" + token) {}
+        : token_(token), apiBase_("https://api.telegram.org/bot" + token) {
+        json meResp;
+        if (Http::getJson(apiBase_ + "/getMe", meResp)) {
+            if (meResp.value("ok", false)) {
+                botId_ = meResp["result"].value("id", 0LL);
+                LOG_INFO("Bot ID: " + std::to_string(botId_));
+            }
+        }
+        if (botId_ == 0) {
+            LOG_WARN("Could not retrieve bot ID. via_bot detection will be limited.");
+        }
+    }
+
+    int64_t botId() const noexcept { return botId_; }
 
     json getUpdates(long offset) {
         json out;
-        std::string url = apiBase_ + "/getUpdates?timeout=" + std::to_string(cfg::POLL_TIMEOUT_SEC)
-                          + "&allowed_updates=[\"message\",\"channel_post\"]&offset=" + std::to_string(offset);
+        std::string url = apiBase_ + "/getUpdates?timeout=" + std::to_string(cfg::POLL_TIMEOUT_SEC) +
+                          "&allowed_updates=[\"message\",\"channel_post\"]&offset=" + std::to_string(offset);
         Http::getJson(url, out, (cfg::POLL_TIMEOUT_SEC + 5) * 1000, 1);
         return out;
     }
@@ -1304,22 +1265,17 @@ public:
             {"disable_web_page_preview", true}
         };
 
-        // Retry loop с правильной обработкой 429
         for (int attempt = 0; attempt < 3; ++attempt) {
             auto resp = Http::post(apiBase_ + "/sendMessage", body);
-
             if (resp.status == 200) return true;
-
             if (resp.status == 429) {
                 int retryAfter = 5;
                 if (resp.parsed.contains("parameters")) {
                     retryAfter = resp.parsed["parameters"].value("retry_after", 5);
-                }
-                LOG_WARN("Telegram rate limit 429, retry after " + std::to_string(retryAfter) + "s");
+                }                LOG_WARN("Telegram rate limit 429, retry after " + std::to_string(retryAfter) + "s");
                 std::this_thread::sleep_for(std::chrono::seconds(retryAfter));
                 continue;
             }
-
             LOG_ERR("Telegram sendMessage failed: HTTP " + std::to_string(resp.status));
             return false;
         }
@@ -1328,177 +1284,193 @@ public:
 
     void handleCommand(const std::string& cmd, int64_t chatId,
                        const BotStats& stats, const DB& db,
-                       const BscRpc& rpc, long currentOffset) {
-        if (cmd == "/stats") {
-            sendStats(chatId, stats, db);
-        } else if (cmd == "/health") {
-            // FIX #12 (review point #4): /health fans out to Telegram
-            // getMe + DexScreener + GeckoTerminal + a BSC RPC node on every
-            // call. An admin (or a misbehaving client) firing it in a tight
-            // loop risks tripping rate limits on those APIs for reasons
-            // unrelated to the bot's own traffic. Enforce a minimum gap
-            // between checks; on a too-soon repeat, say so instead of
-            // silently doing nothing (silently ignoring a command an admin
-            // just sent is its own kind of confusing).
-            int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            int64_t elapsed = now - lastHealthCheckTs_;
-            if (lastHealthCheckTs_ != 0 && elapsed < cfg::HEALTH_COMMAND_COOLDOWN_SEC) {
-                sendMessage(chatId, "⏳ /health was just run " + std::to_string(elapsed) +
-                            "s ago. Please wait " +
-                            std::to_string(cfg::HEALTH_COMMAND_COOLDOWN_SEC - elapsed) +
-                            "s before checking again.");
-                return;
-            }
-            lastHealthCheckTs_ = now;
-            sendHealth(chatId, db, rpc, currentOffset);
-        }
-    }
+                       const BscRpc& rpc, long currentOffset,
+                       const class TaskQueue& taskQueue,
+                       const class TelegramSender& tgSender);
 
 private:
-    void sendStats(int64_t chatId, const BotStats& stats, const DB& db) {
-        auto now = std::chrono::system_clock::now();
-        auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - stats.startTime).count();
-
-        int days = uptime / 86400;
-        int hours = (uptime % 86400) / 3600;
-        int mins = (uptime % 3600) / 60;
-
-        std::ostringstream s;
-        s << "📊 BOT STATS\n\n";
-        s << "⏱ Uptime: " << days << "d " << hours << "h " << mins << "m\n";
-        s << "📨 Messages received: " << stats.totalMessagesReceived.load() << "\n";
-        s << "✅ TX processed: " << stats.totalTxProcessed.load() << "\n";
-        s << "❌ Total errors: " << stats.totalErrors.load() << "\n";
-        s << "   ├─ RPC errors: " << stats.rpcErrors.load() << "\n";
-        s << "   ├─ Market errors: " << stats.marketErrors.load() << "\n";
-        s << "   └─ Telegram errors: " << stats.telegramErrors.load() << "\n";
-        s << "\n";
-        s << "💾 Database:\n";
-        s << "   ├─ Total TX in DB: " << db.getTotalProcessed() << "\n";
-        int64_t dbSize = db.getDbSizeBytes();
-        if (dbSize >= 1024 * 1024) {
-            s << "   └─ DB size: " << std::fixed << std::setprecision(2)
-              << (dbSize / (1024.0 * 1024.0)) << " MB\n";
-        } else {
-            s << "   └─ DB size: " << (dbSize / 1024) << " KB\n";
-        }
-
-        sendMessage(chatId, s.str());
-    }
-
-    void sendHealth(int64_t chatId, const DB& db, const BscRpc& rpc, long currentOffset) {
-        std::ostringstream s;
-        s << "🏥 HEALTH CHECK\n\n";
-
-        // 1. DB ping через существующее соединение
-        bool dbOk = db.ping();
-        s << (dbOk ? "✅ Database: OK\n" : "❌ Database: FAIL\n");
-
-        // 2. RPC — проверяем только первый рабочий (быстро!)
-        bool rpcOk = false;
-        std::string workingRpc;
-        for (const auto& rpcUrl : cfg::BSC_RPC) {
-            json req = {{"jsonrpc","2.0"},{"id",1},{"method","eth_blockNumber"},{"params",json::array()}};
-            auto resp = Http::post(rpcUrl, req, cfg::HEALTH_TIMEOUT_MS, 0);
-            if (resp.ok() && resp.parsed.contains("result")) {
-                rpcOk = true;
-                workingRpc = rpcUrl;
-                break;
-            }
-        }
-        s << (rpcOk ? "✅ BSC RPC: OK\n" : "❌ BSC RPC: FAIL\n");
-
-        // 3. Telegram
-        bool tgOk = false;
-        auto tgResp = Http::get(apiBase_ + "/getMe", cfg::HEALTH_TIMEOUT_MS, 0);
-        if (tgResp.ok() && tgResp.parsed.value("ok", false)) tgOk = true;
-        s << (tgOk ? "✅ Telegram API: OK\n" : "❌ Telegram API: FAIL\n");
-
-        // 4. Market APIs — параллельно не можем, но быстро
-        bool dexOk = false, geckoOk = false;
-        auto dexResp = Http::get(cfg::DEXSCREENER_BASE + "/latest/dex/tokens/0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
-                                  cfg::HEALTH_TIMEOUT_MS, 0);
-        if (dexResp.ok()) dexOk = true;
-        s << (dexOk ? "✅ DexScreener: OK\n" : "⚠️ DexScreener: UNAVAILABLE\n");
-
-        auto geckoResp = Http::get(cfg::GECKO_BASE + "/api/v2/networks/bsc/tokens/0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c/pools?limit=1",
-                                    cfg::HEALTH_TIMEOUT_MS, 0);
-        if (geckoResp.ok()) geckoOk = true;
-        s << (geckoOk ? "✅ GeckoTerminal: OK\n" : "⚠️ GeckoTerminal: UNAVAILABLE\n");
-
-        s << "\n";
-
-        // Расширенная информация
-        s << "🔧 DETAILS\n";
-        s << "Current RPC: " << (workingRpc.empty() ? rpc.getCurrentRpc() : workingRpc) << "\n";
-
-        std::string lastTx = db.getLastTx();
-        if (!lastTx.empty()) {
-            s << "Last TX: " << lastTx.substr(0, 10) << "..." << lastTx.substr(lastTx.size() - 6) << "\n";
-        } else {
-            s << "Last TX: none\n";
-        }
-
-        s << "Current offset: " << currentOffset << "\n";
-
-        int64_t lastMktTs = db.getLastMktOk();
-        if (lastMktTs > 0) {
-            auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-            s << "Last market fetch: " << (now - lastMktTs) << " sec ago\n";
-        } else {
-            s << "Last market fetch: never\n";
-        }
-
-        s << "\n";
-        if (dbOk && rpcOk && tgOk) {
-            s << "🟢 System: HEALTHY\n";
-        } else {
-            s << "🔴 System: DEGRADED\n";
-        }
-
-        sendMessage(chatId, s.str());
-    }
+    void sendStats(int64_t chatId, const BotStats& stats, const DB& db);
+    void sendHealth(int64_t chatId, const DB& db, const BscRpc& rpc, long currentOffset,
+                    const BotStats& stats,
+                    const class TaskQueue& taskQueue,
+                    const class TelegramSender& tgSender);
 };
 
 // ============================================================================
-//  MAINTENANCE THREAD (VACUUM раз в сутки в отдельном потоке)
+//  TASK QUEUE (with atomic size)
 // ============================================================================
-class MaintenanceThread {
-    std::thread thread_;
-    std::mutex mtx_;
-    std::condition_variable cv_;
-    std::atomic<bool> stop_{false};
-    DB* db_;
+class TaskQueue {
+    std::deque<WhaleTask> q_;
+    mutable std::mutex mtx_;
+    std::condition_variable cv_, notFullCv_;
+    bool shuttingDown_ = false;
+    size_t maxSize_;
+    std::atomic<size_t> currentSize_{0};
 
 public:
-    explicit MaintenanceThread(DB* db) : db_(db) {}
+    explicit TaskQueue(size_t maxSize) : maxSize_(maxSize) {}
+
+    bool push(WhaleTask task) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        notFullCv_.wait(lk, [this]() { return q_.size() < maxSize_ || shuttingDown_; });
+        if (shuttingDown_) return false;
+
+        if (task.enqueueTs == 0) {
+            task.enqueueTs = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+
+        q_.push_back(std::move(task));
+        currentSize_.fetch_add(1);        cv_.notify_one();
+        return true;
+    }
+
+    bool tryPushFor(WhaleTask task, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        bool gotSlot = notFullCv_.wait_for(lk, timeout,
+            [this]() { return q_.size() < maxSize_ || shuttingDown_; });
+        if (!gotSlot || shuttingDown_) return false;
+
+        if (task.enqueueTs == 0) {
+            task.enqueueTs = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+        }
+
+        q_.push_back(std::move(task));
+        currentSize_.fetch_add(1);
+        cv_.notify_one();
+        return true;
+    }
+
+    bool pop(WhaleTask& out) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait(lk, [this]() { return !q_.empty() || shuttingDown_; });
+        if (q_.empty()) return false;
+        out = std::move(q_.front());
+        q_.pop_front();
+        currentSize_.fetch_sub(1);
+        notFullCv_.notify_one();
+        return true;
+    }
+
+    size_t size() const { return currentSize_.load(); }
+
+    int64_t oldestPendingTaskAge() const {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (q_.empty()) return 0;
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        return now - q_.front().enqueueTs;
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        shuttingDown_ = true;
+        cv_.notify_all();
+        notFullCv_.notify_all();
+    }
+};
+// ============================================================================
+//  TELEGRAM SENDER (with bounded queue)
+// ============================================================================
+struct TgOutgoing {
+    std::string txLower;
+    int64_t chatId;
+    std::string text;
+};
+
+class TelegramSender {
+    std::deque<TgOutgoing> q_;
+    std::mutex mtx_;
+    std::condition_variable cv_, notFullCv_;
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+    std::atomic<size_t> currentSize_{0};
+    TgBot& bot_;
+    BotStats& stats_;
+    DB& db_;
+
+public:
+    TelegramSender(TgBot& bot, BotStats& stats, DB& db)
+        : bot_(bot), stats_(stats), db_(db) {}
 
     void start() {
         thread_ = std::thread([this]() {
-            std::unique_lock<std::mutex> lk(mtx_);
-            while (!stop_.load()) {
-                // Ждём MAINTENANCE_INTERVAL_HOURS или сигнал остановки
-                cv_.wait_for(lk, std::chrono::hours(cfg::MAINTENANCE_INTERVAL_HOURS),
-                             [this]() { return stop_.load(); });
-                if (stop_.load()) break;
+            while (true) {
+                TgOutgoing msg;
+                {
+                    std::unique_lock<std::mutex> lk(mtx_);
+                    cv_.wait(lk, [this]() { return !q_.empty() || stop_.load(); });
+                    if (stop_.load() && q_.empty()) break;
+                    if (q_.empty()) continue;
+                    msg = std::move(q_.front());
+                    q_.pop_front();
+                    currentSize_.fetch_sub(1);
+                    notFullCv_.notify_one();
+                }
 
-                LOG_INFO("Running scheduled maintenance...");
-                db_->maintenance();
+                bool ok = bot_.sendMessage(msg.chatId, msg.text);
+                if (ok) {
+                    db_.markDone(msg.txLower);
+                    LOG_INFO("Published analysis for " + msg.txLower);
+                } else {
+                    stats_.telegramErrors++;
+                    stats_.totalErrors++;
+                    db_.incTgErr();
+                    db_.incErrors();
+                    LOG_ERR("Publish failed for " + msg.txLower +
+                            ", leaving status=0 for StaleTaskReclaimer");                }
             }
         });
     }
 
+    void push(TgOutgoing msg) {
+        std::unique_lock<std::mutex> lk(mtx_);
+        notFullCv_.wait(lk, [this]() {
+            return q_.size() < cfg::MAX_TG_QUEUE_SIZE || stop_.load();
+        });
+        if (stop_.load()) return;
+        q_.push_back(std::move(msg));
+        currentSize_.fetch_add(1);
+        cv_.notify_one();
+    }
+
+    size_t size() const { return currentSize_.load(); }
+
     void stop() {
-        stop_.store(true);
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            stop_.store(true);
+        }
         cv_.notify_all();
+        notFullCv_.notify_all();
         if (thread_.joinable()) thread_.join();
     }
 };
 
 // ============================================================================
-//  MESSAGE BUILDER
+//  WORKER HEARTBEATS
+// ============================================================================
+class WorkerHeartbeats {
+    std::vector<std::atomic<int64_t>> lastBeat_;
+
+public:
+    explicit WorkerHeartbeats(int n) : lastBeat_(n) {
+        int64_t now = nowSec();
+        for (auto& b : lastBeat_) b.store(now);
+    }
+
+    void beat(int id) { lastBeat_[id].store(nowSec()); }
+    int64_t lastBeat(int id) const { return lastBeat_[id].load(); }
+    int count() const { return (int)lastBeat_.size(); }
+
+    static int64_t nowSec() {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+};
+// ============================================================================
+//  REPORT BUILDER
 // ============================================================================
 std::string typeEmoji(const std::string& t) {
     if (t == "BUY")     return "🟢 BUY";
@@ -1515,6 +1487,13 @@ std::string buildReport(const ParsedMsg& p, const TxInfo& tx, const MarketData& 
     s << typeEmoji(tx.type) << "\n";
     s << "🪙 " << (!md.symbol.empty() ? md.symbol : (!p.coin.empty() ? p.coin :
         (tx.tokenAddr.size() > 10 ? tx.tokenAddr.substr(0, 10) + "..." : tx.tokenAddr))) << "\n";
+
+    if (md.source == "CIRCUIT_BREAKER") {
+        s << "\n⚠️ Market data temporarily unavailable\n";
+        s << "(Circuit breaker active due to too many failures)\n";
+        return s.str();
+    }
+
     if (md.priceUsd > 0)
         s << "💰 $" << std::fixed << std::setprecision(4) << md.priceUsd << "\n";
     s << "\n";
@@ -1538,16 +1517,15 @@ std::string buildReport(const ParsedMsg& p, const TxInfo& tx, const MarketData& 
             md.candles1m.end() - 60
         );
         rsi1h = ind::rsi(oldCandles, cfg::RSI_PERIOD);
-        srsi1h = ind::stochRsi(oldCandles);
-        vol1h = ind::sumVolume(oldCandles, 60);
+        srsi1h = ind::stochRsi(oldCandles);        vol1h = ind::sumVolume(oldCandles, 60);
     }
 
     s << "📈 RSI\n";
     if (std::isnan(rsiNow)) {
-        s << "⚠️ RSI недоступен\n";
+        s << "⚠️ RSI unavailable\n";
     } else if (std::isnan(rsi1h)) {
         s << ind::rsiColor(rsiNow) << " " << std::fixed << std::setprecision(1) << rsiNow << "\n";
-        s << "(мало данных для сравнения)\n";
+        s << "(not enough data for comparison)\n";
     } else {
         double diff = rsiNow - rsi1h;
         std::string arrow = diff >= 0 ? "⬆️" : "⬇️";
@@ -1559,10 +1537,10 @@ std::string buildReport(const ParsedMsg& p, const TxInfo& tx, const MarketData& 
 
     s << "📊 Stoch RSI\n";
     if (std::isnan(srsiNow)) {
-        s << "⚠️ Stoch RSI недоступен\n";
+        s << "⚠️ Stoch RSI unavailable\n";
     } else if (std::isnan(srsi1h)) {
         s << ind::stochColor(srsiNow) << " " << std::fixed << std::setprecision(2) << srsiNow << "\n";
-        s << "(мало данных для сравнения)\n";
+        s << "(not enough data for comparison)\n";
     } else {
         double diff = srsiNow - srsi1h;
         std::string arrow = diff >= 0 ? "⬆️" : "⬇️";
@@ -1572,12 +1550,12 @@ std::string buildReport(const ParsedMsg& p, const TxInfo& tx, const MarketData& 
     }
     s << "\n";
 
-    s << "📦 Объём\n";
+    s << "📦 Volume\n";
     if (!md.ok || volNow == 0) {
-        s << "⚠️ Объём недоступен\n";
+        s << "⚠️ Volume unavailable\n";
     } else if (vol1h == 0) {
         s << ind::volColor(100) << " " << ind::fmtNum(volNow) << "\n";
-        s << "(мало данных для сравнения)\n";
+        s << "(not enough data for comparison)\n";
     } else {
         double pct = ((volNow - vol1h) / vol1h) * 100.0;
         std::string arrow = pct >= 0 ? "⬆️" : "⬇️";
@@ -1587,9 +1565,8 @@ std::string buildReport(const ParsedMsg& p, const TxInfo& tx, const MarketData& 
     }
     s << "\n";
 
-    s << "💧 Ликвидность\n";
-    if (!md.ok) {
-        s << "⚠️ Ликвидность недоступна\n";
+    s << "💧 Liquidity\n";
+    if (!md.ok) {        s << "⚠️ Liquidity unavailable\n";
     } else {
         s << ind::liqColor(md.liquidityUsd) << " $" << ind::fmtNum(md.liquidityUsd) << "\n";
     }
@@ -1598,127 +1575,8 @@ std::string buildReport(const ParsedMsg& p, const TxInfo& tx, const MarketData& 
 }
 
 // ============================================================================
-//  GRACEFUL SHUTDOWN
+//  WORKER POOL
 // ============================================================================
-static std::atomic<bool> g_running{true};
-void onSignal(int) {
-    LOG_INFO("Signal received, shutting down...");
-    g_running = false;
-}
-
-// ============================================================================
-//  FIX #4: POLLER + WORKER POOL
-// ============================================================================
-//  Previously, getUpdates() -> classify -> RPC -> DexScreener -> GeckoTerminal
-//  -> sendMessage all happened synchronously inside the same loop that calls
-//  Telegram's long-polling getUpdates(). Any one slow whale tx (RPC timeout +
-//  market API timeouts can add up to tens of seconds) blocked the bot from
-//  reading new Telegram updates for that whole time. For an active source
-//  channel this is a real risk of falling behind or even missing updates if
-//  the gap exceeds what Telegram buffers.
-//
-//  The fix splits the single loop into:
-//    - one poller (stays in main()): only calls getUpdates(), handles admin
-//      commands inline (those are fast: DB ping + a couple of HEALTH_TIMEOUT_MS
-//      probes), and pushes channel_post tasks onto a shared queue.
-//    - a small pool of worker threads: each pulls one task at a time, does
-//      the RPC + market-data + classification + sendMessage work, fully in
-//      parallel with the poller and with each other.
-//
-//  Two correctness details that fall out of this:
-//    1. TOCTOU on duplicate detection: with multiple workers, "check exists()
-//       then insert() after processing" lets two workers both see exists()
-//       == false for the same tx and both publish it. DB::tryClaim() closes
-//       this by making "is this tx new" and "mark it as ours" a single
-//       atomic operation, called by the poller BEFORE the task is queued —
-//       so only one task for a given tx hash ever enters the queue at all.
-//    2. Offset persistence: since tryClaim() happens at enqueue time (in the
-//       poller, synchronously), it's safe to advance and save the Telegram
-//       offset as soon as a task is claimed/queued, without waiting for the
-//       worker to finish processing it. A restart can re-deliver an update
-//       whose worker hadn't finished yet (Telegram's offset semantics allow
-//       this), but it will be a no-op: tryClaim() will see the tx already
-//       in processed_tx and simply not requeue it.
-// ============================================================================
-
-struct WhaleTask {
-    ParsedMsg parsed;
-    std::string txLower;
-};
-
-// Simple bounded-free thread-safe FIFO queue with blocking pop and an
-// explicit shutdown signal so workers can exit cleanly instead of blocking
-// forever on an empty queue when the bot is shutting down.
-class TaskQueue {
-    std::deque<WhaleTask> q_;
-    mutable std::mutex mtx_;
-    std::condition_variable cv_;          // signaled when a slot is freed (pop) or shutdown
-    std::condition_variable notFullCv_;   // signaled when an item is added (push) or shutdown
-    bool shuttingDown_ = false;
-    size_t maxSize_;
-
-public:
-    explicit TaskQueue(size_t maxSize) : maxSize_(maxSize) {}
-
-    // FIX #8: previously unbounded (std::deque<WhaleTask> q_ with no cap).
-    // If the source channel suddenly bursts hundreds of messages a minute
-    // and workers can't keep up (slow RPC/market APIs), the queue grows
-    // without limit and the process's memory grows with it. push() now
-    // blocks the poller once the queue is full, applying backpressure
-    // instead of accepting unbounded work — the poller will simply pause
-    // reading new Telegram updates until a worker frees a slot, which is
-    // safe since Telegram retains undelivered updates for the long-poll
-    // window. Returns false only if shutdown() was called while waiting
-    // (caller should drop the task rather than push after shutdown).
-    bool push(WhaleTask task) {
-        std::unique_lock<std::mutex> lk(mtx_);
-        notFullCv_.wait(lk, [this]() { return q_.size() < maxSize_ || shuttingDown_; });
-        if (shuttingDown_) return false;
-        q_.push_back(std::move(task));
-        cv_.notify_one();
-        return true;
-    }
-
-    // Returns false if the queue was shut down and is empty (caller should
-    // exit its worker loop).
-    bool pop(WhaleTask& out) {
-        std::unique_lock<std::mutex> lk(mtx_);
-        cv_.wait(lk, [this]() { return !q_.empty() || shuttingDown_; });
-        if (q_.empty()) return false;  // implies shuttingDown_
-        out = std::move(q_.front());
-        q_.pop_front();
-        notFullCv_.notify_one();  // freed a slot, wake any blocked push()
-        return true;
-    }
-
-    // FIX #9: mtx_ is now `mutable` (matching the pattern already used in
-    // DB and BscRpc) instead of const_cast-ing it away here. const_cast on
-    // a non-mutable member to satisfy a const method is technically legal
-    // as long as the object itself isn't truly const, but it's a footgun:
-    // it silently relies on that invariant holding forever, and looks like
-    // constness is being bypassed rather than correctly modeled. `mutable`
-    // says directly "this mutex is an implementation detail, not part of
-    // the logical const-ness of the queue."
-    size_t size() const {
-        std::lock_guard<std::mutex> lk(mtx_);
-        return q_.size();
-    }
-
-    void shutdown() {
-        std::lock_guard<std::mutex> lk(mtx_);
-        shuttingDown_ = true;
-        cv_.notify_all();
-        notFullCv_.notify_all();
-    }
-};
-
-// Owns N worker threads that each pull WhaleTasks from a shared TaskQueue
-// and run the full RPC + market-data + classification + publish pipeline.
-// All shared state (DB, BscRpc, TgBot, MarketAggregator instances, BotStats)
-// is already internally synchronized by its own class (DB has mtx_, BscRpc
-// has mtx_, BotStats fields are atomic), so workers can safely share single
-// instances of each passed in by reference — no additional locking needed
-// at the WorkerPool level itself.
 class WorkerPool {
     std::vector<std::thread> threads_;
     TaskQueue& queue_;
@@ -1728,12 +1586,14 @@ class WorkerPool {
     MarketAggregator& market_;
     BotStats& stats_;
     WorkerHeartbeats& heartbeats_;
+    TelegramSender& tgSender_;
 
 public:
     WorkerPool(TaskQueue& queue, DB& db, TgBot& bot, BscRpc& rpc,
-               MarketAggregator& market, BotStats& stats, WorkerHeartbeats& heartbeats)
-        : queue_(queue), db_(db), bot_(bot), rpc_(rpc), market_(market), stats_(stats),
-          heartbeats_(heartbeats) {}
+               MarketAggregator& market, BotStats& stats,
+               WorkerHeartbeats& heartbeats, TelegramSender& tgSender)
+        : queue_(queue), db_(db), bot_(bot), rpc_(rpc), market_(market),
+          stats_(stats), heartbeats_(heartbeats), tgSender_(tgSender) {}
 
     void start(int numWorkers) {
         for (int i = 0; i < numWorkers; ++i) {
@@ -1741,18 +1601,6 @@ public:
         }
     }
 
-    // FIX #11: called by the watchdog thread when worker `workerId`'s
-    // heartbeat has gone stale. Starts an *additional* thread that drains
-    // the same queue and reports heartbeats under the same workerId slot —
-    // it does not (cannot) stop the original hung thread; see the
-    // WorkerHeartbeats comment above for why. The detached thread is moved
-    // into threads_ so joinAll() at shutdown still waits for it.
-    // Note: the replacement shares its heartbeat slot with the original
-    // hung thread (both write lastBeat_[workerId]). This is intentional —
-    // if either one is alive and progressing, the slot looks healthy,
-    // which is the correct signal ("this pool position is being served
-    // again"). If the replacement also gets stuck, the slot goes stale
-    // again and the watchdog spins up yet another replacement.
     void startReplacementWorker(int workerId) {
         threads_.emplace_back([this, workerId]() { run(workerId); });
     }
@@ -1767,25 +1615,21 @@ private:
     void run(int workerId) {
         WhaleTask task;
         heartbeats_.beat(workerId);
+        stats_.activeWorkers.fetch_add(1);
         while (queue_.pop(task)) {
             try {
-                process(task);
+                process(task, workerId);
             } catch (const std::exception& e) {
                 LOG_ERR("worker[" + std::to_string(workerId) + "] exception: " + std::string(e.what()));
             }
-            // FIX #11: beat AFTER finishing a task, not just at loop start —
-            // a worker that picks up one slow-but-eventually-completing task
-            // and then blocks in queue_.pop() waiting for the next one is
-            // healthy (pop() doesn't busy-loop), but a worker stuck *inside*
-            // process() for far longer than any task should reasonably take
-            // will show a stale heartbeat to the watchdog, which is exactly
-            // the case we want to detect.
             heartbeats_.beat(workerId);
         }
+
+        stats_.activeWorkers.fetch_sub(1);
         LOG_INFO("worker[" + std::to_string(workerId) + "] exiting");
     }
 
-    void process(const WhaleTask& task) {
+    void process(const WhaleTask& task, int workerId) {
         const ParsedMsg& p = task.parsed;
         const std::string& txLower = task.txLower;
 
@@ -1794,19 +1638,18 @@ private:
         json txData, receipt;
         bool haveTx = rpc_.getTx(txLower, txData);
         bool haveRc = rpc_.getReceipt(txLower, receipt);
+        heartbeats_.beat(workerId);
 
         TxInfo tx;
         if (haveTx && haveRc) {
-            std::string whaleAddr = p.whaleAddr;
-            if (whaleAddr.empty()) whaleAddr = txData.value("from", "");
+            std::string whaleAddr = p.whaleAddr.empty() ? txData.value("from", "") : p.whaleAddr;
             tx = classifier::classify(txData, receipt, whaleAddr);
             LOG_INFO("Classified: " + tx.type + " token=" + tx.tokenAddr);
             if (tx.type != "UNKNOWN") {
                 stats_.totalTxProcessed++;
                 db_.incTxOk();
             }
-            stats_.lastRpcOkTs.store(std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count());
+            stats_.lastRpcOkTs.store(WorkerHeartbeats::nowSec());
             db_.setLastRpcOk(stats_.lastRpcOkTs.load());
         } else {
             tx.type = "UNKNOWN";
@@ -1821,65 +1664,67 @@ private:
         MarketData md;
         if (!contract.empty()) {
             md = market_.fetch(contract);
-            LOG_INFO("Market data: source=" + md.source + " ok=" +
-                     (md.ok ? "true" : "false") + " candles=" +
+            LOG_INFO("Market data: source=" + md.source + " ok=" +                     (md.ok ? "true" : "false") + " candles=" +
                      std::to_string(md.candles1m.size()));
             if (md.ok) {
-                stats_.lastMktOkTs.store(std::chrono::duration_cast<std::chrono::seconds>(
-                    std::chrono::system_clock::now().time_since_epoch()).count());
+                stats_.lastMktOkTs.store(WorkerHeartbeats::nowSec());
                 db_.setLastMktOk(stats_.lastMktOkTs.load());
-            } else {
+            } else if (md.source != "CIRCUIT_BREAKER") {
                 stats_.marketErrors++;
                 stats_.totalErrors++;
                 db_.incMarketErr();
                 db_.incErrors();
             }
         }
+        heartbeats_.beat(workerId);
 
         std::string report = buildReport(p, tx, md);
-        if (bot_.sendMessage(cfg::OUTPUT_CHANNEL, report)) {
-            LOG_INFO("Published analysis for " + txLower);
-        } else {
-            stats_.telegramErrors++;
-            stats_.totalErrors++;
-            db_.incTgErr();
-            db_.incErrors();
-            LOG_ERR("Publish failed for " + txLower);
-        }
+        tgSender_.push({txLower, cfg::OUTPUT_CHANNEL, report});
+        LOG_INFO("Queued analysis for " + txLower);
 
         stats_.setLastTx(txLower);
         db_.setLastTx(txLower);
 
-        // FIX #7: mark this tx as fully handled now that processing has
-        // run to completion (sendMessage() above already retried 429s
-        // internally, so by this point it's either published or has
-        // exhausted its own retry budget). This is what distinguishes
-        // "claimed but the process crashed mid-flight" (status stays 0,
-        // reclaimStaleQueued() retries it next startup) from "we actually
-        // finished with this tx" (status=1, never retried again even if
-        // sendMessage ultimately failed — a hard Telegram failure here
-        // would need operator attention, not silent infinite retries).
-        db_.markDone(txLower);
-
-        // FIX #3, still applies here: counter-based cleanup trigger instead
-        // of (row count % CLEANUP_TRIGGER).
         if (db_.noteInsertedAndShouldCleanup(cfg::CLEANUP_TRIGGER)) {
-            db_.cleanup(cfg::KEEP_LAST_TX);
+            db_.cleanup(0);
         }
     }
 };
 
 // ============================================================================
-//  FIX #10 (review point #1): STALE TASK RECLAIMER
+//  MAINTENANCE THREAD
 // ============================================================================
-//  reclaimStaleQueued() at startup only catches tasks orphaned by a process
-//  crash/restart. It does nothing for a worker that's still "alive" (the
-//  process didn't die) but stuck forever inside a call that never times out
-//  at the OS level. In that case the status=0 row sits there indefinitely
-//  while the process keeps running. This thread runs periodically during
-//  normal operation, not just at startup, and reclaims any status=0 row
-//  that's been queued for longer than STALE_TASK_TTL_SECONDS by pushing it
-//  back onto the live TaskQueue for a second attempt.
+class MaintenanceThread {
+    std::thread thread_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::atomic<bool> stop_{false};
+    DB* db_;
+
+public:
+    explicit MaintenanceThread(DB* db) : db_(db) {}
+
+    void start() {
+        thread_ = std::thread([this]() {
+            std::unique_lock<std::mutex> lk(mtx_);
+            while (!stop_.load()) {
+                cv_.wait_for(lk, std::chrono::hours(cfg::MAINTENANCE_INTERVAL_HOURS),
+                             [this]() { return stop_.load(); });
+                if (stop_.load()) break;
+                LOG_INFO("Running scheduled maintenance...");
+                db_->maintenance();
+            }        });
+    }
+
+    void stop() {
+        stop_.store(true);
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+};
+
+// ============================================================================
+//  STALE TASK RECLAIMER
 // ============================================================================
 class StaleTaskReclaimer {
     std::thread thread_;
@@ -1900,79 +1745,32 @@ public:
                              [this]() { return stop_.load(); });
                 if (stop_.load()) break;
 
-                auto stale = db_->reclaimStaleQueued(cfg::STALE_TASK_TTL_SECONDS);
+                auto stale = db_->tryRequeueStale(cfg::STALE_TASK_TTL_SECONDS, cfg::MAX_RECLAIM_ATTEMPTS);
                 if (!stale.empty()) {
-                    LOG_WARN("StaleTaskReclaimer: " + std::to_string(stale.size()) +
+                    LOG_WARN("StaleTaskReclaimer: requeuing " + std::to_string(stale.size()) +
                              " tx(es) stuck in status=0 for over " +
-                             std::to_string(cfg::STALE_TASK_TTL_SECONDS) +
-                             "s, reclaiming (may produce a duplicate report "
-                             "if the original worker is just slow, not hung)");
-                    for (const auto& txLower : stale) {
-                        WhaleTask task;
-                        task.txLower = txLower;
-                        // Best-effort: if the queue is full or shutting
-                        // down, push() blocks/fails gracefully; the next
-                        // periodic pass will pick this row up again since
-                        // it's still status=0 either way.
-                        queue_->push(std::move(task));
+                             std::to_string(cfg::STALE_TASK_TTL_SECONDS) + "s");
+                    for (auto& task : stale) {
+                        if (!queue_->tryPushFor(std::move(task),
+                                std::chrono::milliseconds(cfg::STALE_RECLAIMER_PUSH_TIMEOUT_MS))) {
+                            LOG_WARN("StaleTaskReclaimer: queue full/shutting down, deferring tx " +
+                                     task.txLower + " to next pass");
+                        }
                     }
                 }
             }
         });
     }
 
-    void stop() {
-        stop_.store(true);
+    void stop() {        stop_.store(true);
         cv_.notify_all();
         if (thread_.joinable()) thread_.join();
     }
 };
 
-// FIX #11 (review point #5): no built-in watchdog for a hung worker.
-// std::thread has no portable, safe way to forcibly cancel a thread stuck
-// inside a blocking call (e.g. a TLS handshake or DNS lookup with no
-// internal timeout) — there is no cooperative cancellation point inside
-// httplib's blocking I/O calls that this code controls. So a true "kill
-// and restart that exact thread" is not achievable here. What IS
-// achievable, and what this does: each worker stamps a heartbeat
-// timestamp before/after every task; a separate watchdog thread polls
-// those heartbeats, and if one hasn't moved in WORKER_HANG_TIMEOUT_SEC,
-// it logs a clear operator-facing warning and spins up a *replacement*
-// worker thread so the pool's effective concurrency doesn't silently
-// shrink to zero over time (the review's "3 workers -> 2 -> 1 -> 0"
-// scenario). The original hung thread is intentionally left running:
-// killing it unsafely could corrupt shared state (DB's sqlite3* handle,
-// for instance) far worse than leaking one stuck OS thread until process
-// exit. The task that hung worker was processing stays status=0 in the DB
-// and is separately recovered by StaleTaskReclaimer/TTL (review point #1),
-// independent of whether its original worker thread ever wakes up.
-class WorkerHeartbeats {
-    std::vector<std::atomic<int64_t>> lastBeat_;
-
-public:
-    explicit WorkerHeartbeats(int n) : lastBeat_(n) {
-        int64_t now = nowSec();
-        for (auto& b : lastBeat_) b.store(now);
-    }
-    void beat(int workerId) { lastBeat_[workerId].store(nowSec()); }
-    int64_t lastBeat(int workerId) const { return lastBeat_[workerId].load(); }
-    int count() const { return (int)lastBeat_.size(); }
-
-    static int64_t nowSec() {
-        return std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-    }
-};
-
-// FIX #11 (review point #5), continued: polls WorkerHeartbeats and asks the
-// WorkerPool to start a replacement for any worker slot that's gone stale.
-// Tracks, per worker slot, the heartbeat value it last saw go stale and
-// already reacted to — so if a hung thread's heartbeat simply never moves
-// again, this fires startReplacementWorker() exactly once for it, not
-// every check interval forever. If a replacement is itself later detected
-// stuck (heartbeat value changed when the replacement started, then went
-// stale again), that's treated as a new staleness event and gets its own
-// single replacement.
+// ============================================================================
+//  WATCHDOG
+// ============================================================================
 class Watchdog {
     std::thread thread_;
     std::mutex mtx_;
@@ -1980,11 +1778,15 @@ class Watchdog {
     std::atomic<bool> stop_{false};
     WorkerHeartbeats& heartbeats_;
     WorkerPool& pool_;
+    BotStats& stats_;
     std::vector<int64_t> lastReactedTo_;
+    std::vector<int> replacementCount_;
 
 public:
-    Watchdog(WorkerHeartbeats& heartbeats, WorkerPool& pool)
-        : heartbeats_(heartbeats), pool_(pool), lastReactedTo_(heartbeats.count(), -1) {}
+    Watchdog(WorkerHeartbeats& heartbeats, WorkerPool& pool, BotStats& stats)
+        : heartbeats_(heartbeats), pool_(pool), stats_(stats),
+          lastReactedTo_(heartbeats.count(), -1),
+          replacementCount_(heartbeats.count(), 0) {}
 
     void start() {
         thread_ = std::thread([this]() {
@@ -1999,13 +1801,21 @@ public:
                     int64_t beat = heartbeats_.lastBeat(i);
                     bool stale = (now - beat) > cfg::WORKER_HANG_TIMEOUT_SEC;
                     if (stale && lastReactedTo_[i] != beat) {
-                        LOG_ERR("Watchdog: worker[" + std::to_string(i) + "] heartbeat stale for " +
-                                std::to_string(now - beat) + "s (limit " +
-                                std::to_string(cfg::WORKER_HANG_TIMEOUT_SEC) +
-                                "s) -- starting a replacement worker for this slot. "
-                                "The original thread is left running; see WorkerHeartbeats "
-                                "comment for why it cannot be safely killed.");
                         lastReactedTo_[i] = beat;
+
+                        if (replacementCount_[i] >= cfg::MAX_WORKER_REPLACEMENTS_PER_SLOT) {
+                            LOG_ERR("Watchdog: worker[" + std::to_string(i) + "] has hung " +
+                                    std::to_string(replacementCount_[i]) +
+                                    " times, reaching MAX_WORKER_REPLACEMENTS_PER_SLOT. "
+                                    "NOT starting another replacement thread.");
+                            continue;
+                        }
+
+                        replacementCount_[i]++;                        stats_.hungWorkersDetected.fetch_add(1);
+                        stats_.replacementWorkersStarted.fetch_add(1);
+                        LOG_ERR("Watchdog: worker[" + std::to_string(i) + "] heartbeat stale for " +
+                                std::to_string(now - beat) + "s -- starting replacement #" +
+                                std::to_string(replacementCount_[i]));
                         pool_.startReplacementWorker(i);
                     }
                 }
@@ -2021,6 +1831,233 @@ public:
 };
 
 // ============================================================================
+//  RPC STATS LOGGER
+// ============================================================================
+class RpcStatsLogger {
+    std::thread thread_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::atomic<bool> stop_{false};
+    BscRpc& rpc_;
+
+public:
+    explicit RpcStatsLogger(BscRpc& rpc) : rpc_(rpc) {}
+
+    void start() {
+        thread_ = std::thread([this]() {
+            std::unique_lock<std::mutex> lk(mtx_);
+            while (!stop_.load()) {
+                cv_.wait_for(lk, std::chrono::hours(1), [this]() { return stop_.load(); });
+                if (stop_.load()) break;
+                rpc_.logRpcStats();
+            }
+        });
+    }
+
+    void stop() {
+        stop_.store(true);
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+    }
+};
+// ============================================================================
+//  TELEGRAM BOT IMPLEMENTATIONS (after all classes are defined)
+// ============================================================================
+void TgBot::sendStats(int64_t chatId, const BotStats& stats, const DB& db) {
+    auto now = std::chrono::system_clock::now();
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - stats.startTime).count();
+
+    int days = uptime / 86400;
+    int hours = (uptime % 86400) / 3600;
+    int mins = (uptime % 3600) / 60;
+
+    std::ostringstream s;
+    s << "📊 BOT STATS\n\n";
+    s << "⏱ Uptime: " << days << "d " << hours << "h " << mins << "m\n";
+    s << "📨 Messages received: " << stats.totalMessagesReceived.load() << "\n";
+    s << "✅ TX processed: " << stats.totalTxProcessed.load() << "\n";
+    s << "❌ Total errors: " << stats.totalErrors.load() << "\n";
+    s << "   ├─ RPC errors: " << stats.rpcErrors.load() << "\n";
+    s << "   ├─ Market errors: " << stats.marketErrors.load() << "\n";
+    s << "   └─ Telegram errors: " << stats.telegramErrors.load() << "\n";
+    s << "\n";
+    s << "💾 Database:\n";
+    s << "   ├─ Total TX in DB: " << db.getTotalProcessed() << "\n";
+    int abandoned = db.getAbandonedCount();
+    if (abandoned > 0) {
+        s << "   ├─ ⚠️ Abandoned TX: " << abandoned << "\n";
+    }
+    int64_t dbSize = db.getDbSizeBytes();
+    if (dbSize >= 1024 * 1024) {
+        s << "   └─ DB size: " << std::fixed << std::setprecision(2)
+          << (dbSize / (1024.0 * 1024.0)) << " MB\n";
+    } else {
+        s << "   └─ DB size: " << (dbSize / 1024) << " KB\n";
+    }
+
+    sendMessage(chatId, s.str());
+}
+
+void TgBot::sendHealth(int64_t chatId, const DB& db, const BscRpc& rpc, long currentOffset,
+                       const BotStats& stats,
+                       const TaskQueue& taskQueue,
+                       const TelegramSender& tgSender) {
+    std::ostringstream s;
+    s << "🏥 HEALTH CHECK\n\n";
+
+    bool dbOk = db.ping();
+    s << (dbOk ? "✅ Database: OK\n" : "❌ Database: FAIL\n");
+
+    bool rpcOk = false;
+    std::string workingRpc;    for (const auto& rpcUrl : cfg::BSC_RPC) {
+        json req = {{"jsonrpc","2.0"},{"id",1},{"method","eth_blockNumber"},{"params",json::array()}};
+        auto resp = Http::post(rpcUrl, req, cfg::HEALTH_TIMEOUT_MS, 0);
+        if (resp.ok() && resp.parsed.contains("result")) {
+            rpcOk = true;
+            workingRpc = rpcUrl;
+            break;
+        }
+    }
+    s << (rpcOk ? "✅ BSC RPC: OK\n" : "❌ BSC RPC: FAIL\n");
+
+    bool tgOk = false;
+    auto tgResp = Http::get(apiBase_ + "/getMe", cfg::HEALTH_TIMEOUT_MS, 0);
+    if (tgResp.ok() && tgResp.parsed.value("ok", false)) tgOk = true;
+    s << (tgOk ? "✅ Telegram API: OK\n" : "❌ Telegram API: FAIL\n");
+
+    bool dexOk = false, geckoOk = false;
+    auto dexResp = Http::get(cfg::DEXSCREENER_BASE + "/latest/dex/tokens/0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+                              cfg::HEALTH_TIMEOUT_MS, 0);
+    if (dexResp.ok()) dexOk = true;
+    s << (dexOk ? "✅ DexScreener: OK\n" : "⚠️ DexScreener: UNAVAILABLE\n");
+
+    auto geckoResp = Http::get(cfg::GECKO_BASE + "/api/v2/networks/bsc/tokens/0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c/pools?limit=1",
+                                cfg::HEALTH_TIMEOUT_MS, 0);
+    if (geckoResp.ok()) geckoOk = true;
+    s << (geckoOk ? "✅ GeckoTerminal: OK\n" : "⚠️ GeckoTerminal: UNAVAILABLE\n");
+
+    s << "\n📊 QUEUES\n";
+    size_t taskQ = taskQueue.size();
+    size_t tgQ = tgSender.size();
+    s << "Task queue: " << taskQ << " / " << cfg::MAX_QUEUE_SIZE;
+    if (taskQ > cfg::MAX_QUEUE_SIZE * 0.8) s << " 🔴 CRITICAL";
+    else if (taskQ > cfg::MAX_QUEUE_SIZE * 0.5) s << " ⚠️ HIGH";
+    s << "\n";
+    s << "TG queue: " << tgQ << " / " << cfg::MAX_TG_QUEUE_SIZE;
+    if (tgQ > cfg::MAX_TG_QUEUE_SIZE * 0.8) s << " 🔴 CRITICAL";
+    else if (tgQ > cfg::MAX_TG_QUEUE_SIZE * 0.5) s << " ⚠️ HIGH";
+    s << "\n";
+
+    int64_t oldestAge = taskQueue.oldestPendingTaskAge();
+    s << "Oldest pending task: ";
+    if (oldestAge == 0) s << "none ✅\n";
+    else if (oldestAge < 60) s << oldestAge << " sec ✅\n";
+    else if (oldestAge < 300) s << oldestAge << " sec ⚠️\n";
+    else s << oldestAge << " sec 🔴 CRITICAL\n";
+
+    s << "\n👷 WORKERS\n";
+    uint64_t alive = stats.activeWorkers.load();
+    uint64_t expected = cfg::NUM_WORKER_THREADS;
+    uint64_t hung = stats.hungWorkersDetected.load();    uint64_t replacements = stats.replacementWorkersStarted.load();
+
+    if (alive == expected) {
+        s << "✅ Alive: " << alive << " / " << expected << "\n";
+    } else if (alive > expected) {
+        s << "⚠️ Alive: " << alive << " / " << expected << " (replacements active)\n";
+    } else {
+        s << "🔴 Alive: " << alive << " / " << expected << " (workers missing)\n";
+    }
+
+    if (hung > 0) {
+        s << "⚠️ Hung slots detected: " << hung << "\n";
+        s << "   Replacements spawned: " << replacements << "\n";
+    } else {
+        s << "✅ No hung workers\n";
+    }
+
+    s << "\n🌐 RPC NODES\n";
+    auto rpcStats = rpc.getRpcStats();
+    for (const auto& [url, rate] : rpcStats) {
+        std::string shortUrl = url;
+        if (shortUrl.size() > 40) shortUrl = shortUrl.substr(0, 37) + "...";
+        if (rate >= 95.0) {
+            s << "✅ " << shortUrl << " (" << std::fixed << std::setprecision(1) << rate << "%)\n";
+        } else if (rate >= 80.0) {
+            s << "🟡 " << shortUrl << " (" << rate << "%)\n";
+        } else if (rate > 0.0) {
+            s << "⚠️ " << shortUrl << " (" << rate << "%)\n";
+        } else {
+            s << "❌ " << shortUrl << " (0%)\n";
+        }
+    }
+
+    s << "\n💾 DATABASE\n";
+    s << "Total TX: " << db.getTotalProcessed() << "\n";
+
+    int queued = db.getQueuedCount();
+    s << "Queued (status=0): " << queued;
+    if (queued == 0) s << " ✅\n";
+    else if (queued < 10) s << " ⚠️ (normal during recovery)\n";
+    else s << " 🔴 CRITICAL (possible task leak)\n";
+
+    int abandoned = db.getAbandonedCount();
+    if (abandoned > 0) s << "Abandoned (status=2): " << abandoned << "\n";
+    s << "Size: " << (db.getDbSizeBytes() / 1024) << " KB\n";
+
+    s << "\n📍 Offset: " << currentOffset << "\n";
+
+    std::string lastTx = db.getLastTx();
+    if (lastTx.size() >= 16) {        s << "Last TX: " << lastTx.substr(0, 10) << "..." << lastTx.substr(lastTx.size() - 6) << "\n";
+    } else if (!lastTx.empty()) {
+        s << "Last TX: " << lastTx << "\n";
+    } else {
+        s << "Last TX: none\n";
+    }
+
+    s << "\n";
+    bool healthy = dbOk && rpcOk && tgOk &&
+                   taskQ < cfg::MAX_QUEUE_SIZE * 0.5 &&
+                   tgQ < cfg::MAX_TG_QUEUE_SIZE * 0.5 &&
+                   oldestAge < 300 && hung == 0;
+    if (healthy) s << "🟢 System: HEALTHY\n";
+    else if (dbOk && rpcOk && tgOk) s << "🟡 System: DEGRADED\n";
+    else s << "🔴 System: UNHEALTHY\n";
+
+    sendMessage(chatId, s.str());
+}
+
+void TgBot::handleCommand(const std::string& cmd, int64_t chatId,
+                          const BotStats& stats, const DB& db,
+                          const BscRpc& rpc, long currentOffset,
+                          const TaskQueue& taskQueue,
+                          const TelegramSender& tgSender) {
+    if (cmd == "/stats") {
+        sendStats(chatId, stats, db);
+    } else if (cmd == "/health") {
+        int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        int64_t elapsed = now - lastHealthCheckTs_;
+        if (lastHealthCheckTs_ != 0 && elapsed < cfg::HEALTH_COMMAND_COOLDOWN_SEC) {
+            sendMessage(chatId, "⏳ /health was just run " + std::to_string(elapsed) +
+                        "s ago. Please wait " +
+                        std::to_string(cfg::HEALTH_COMMAND_COOLDOWN_SEC - elapsed) +
+                        "s before checking again.");
+            return;
+        }
+        lastHealthCheckTs_ = now;
+        sendHealth(chatId, db, rpc, currentOffset, stats, taskQueue, tgSender);
+    }
+}
+
+// ============================================================================
+//  GRACEFUL SHUTDOWN
+// ============================================================================
+static std::atomic<bool> g_running{true};
+void onSignal(int) {
+    LOG_INFO("Signal received, shutting down...");
+    g_running = false;
+}
+// ============================================================================
 //  MAIN
 // ============================================================================
 int main() {
@@ -2030,7 +2067,7 @@ int main() {
     std::error_code ec;
     fs::create_directories("logs", ec);
 
-    LOG_INFO("=== Analyzer Bot v1.0 FINAL PRODUCTION HARDENED ===");
+    LOG_INFO("=== Analyzer Bot v1.0 FINAL (Frozen for Soak Test) ===");
 
     DB db;
     if (!db.open(cfg::DB_PATH)) {
@@ -2045,7 +2082,7 @@ int main() {
 
     BotStats stats;
     stats.startTime = std::chrono::system_clock::now();
-    stats.loadFromDb(db);  // Восстанавливаем статистику после рестарта
+    stats.loadFromDb(db);
     LOG_INFO("Stats loaded from DB: messages=" + std::to_string(stats.totalMessagesReceived.load()) +
              " tx=" + std::to_string(stats.totalTxProcessed.load()));
 
@@ -2062,62 +2099,41 @@ int main() {
     }
     LOG_INFO("Start offset=" + std::to_string(offset));
 
-    // Maintenance thread (VACUUM в отдельном потоке)
     MaintenanceThread maint(&db);
     maint.start();
 
-    // FIX #4: dedicated worker pool so RPC/market/Telegram-publish work for
-    // one whale tx never blocks the poller from reading new updates.
-    TaskQueue queue(cfg::MAX_QUEUE_SIZE);
-    // FIX #11: one heartbeat slot per worker, watched by Watchdog below.
-    WorkerHeartbeats heartbeats(cfg::NUM_WORKER_THREADS);
-    WorkerPool workers(queue, db, bot, rpc, market, stats, heartbeats);
+    TelegramSender tgSender(bot, stats, db);
+    tgSender.start();
+
+    TaskQueue queue(cfg::MAX_QUEUE_SIZE);    WorkerHeartbeats heartbeats(cfg::NUM_WORKER_THREADS);
+    WorkerPool workers(queue, db, bot, rpc, market, stats, heartbeats, tgSender);
     workers.start(cfg::NUM_WORKER_THREADS);
     LOG_INFO("Started " + std::to_string(cfg::NUM_WORKER_THREADS) + " worker thread(s)");
 
-    // FIX #11 (review point #5): detects a worker stuck longer than
-    // WORKER_HANG_TIMEOUT_SEC and starts a replacement for that pool slot
-    // so effective concurrency doesn't silently shrink over time.
-    Watchdog watchdog(heartbeats, workers);
+    Watchdog watchdog(heartbeats, workers, stats);
     watchdog.start();
 
-    // FIX #10 (review point #1): periodically reclaims status=0 rows that
-    // have been stuck longer than STALE_TASK_TTL_SECONDS, independent of
-    // whether the worker that claimed them is still technically running.
     StaleTaskReclaimer staleReclaimer(&db, &queue);
     staleReclaimer.start();
 
-    // FIX #7: re-enqueue any tx that was claimed (tryClaim) in a previous
-    // run but never reached markDone() — almost certainly because the
-    // process crashed or was killed mid-processing. Without this, those
-    // tx hashes would sit in processed_tx forever with status=0, and since
-    // tryClaim() already "owns" them, Telegram redelivering that
-    // channel_post would be silently swallowed as a duplicate — the whale
-    // alert is lost for good.
-    //
-    // Caveat: we only persist the tx hash, not the original parsed message
-    // (whale name, contract, coin/amount as written in the post). A
-    // recovered WhaleTask is built with only txLower set; buildReport()'s
-    // existing fallbacks (md.symbol / tx.tokenAddr for the token, "Unknown"
-    // for the whale name) still produce a usable report from on-chain data
-    // alone, just without the original post's display name/contract hint.
+    RpcStatsLogger rpcLogger(rpc);
+    rpcLogger.start();
+
+    // Reclaim tasks from previous run
     {
-        auto stale = db.reclaimStaleQueued();
+        auto stale = db.reclaimAfterRestart();
         if (!stale.empty()) {
             LOG_WARN("Reclaiming " + std::to_string(stale.size()) +
                      " stale queued tx(es) from a previous run");
-            for (const auto& txLower : stale) {
-                WhaleTask task;
-                task.txLower = txLower;
-                // task.parsed left default-constructed (all fields empty);
-                // see caveat above.
-                queue.push(std::move(task));
+            for (auto& task : stale) {
+                if (!queue.tryPushFor(std::move(task), std::chrono::milliseconds(5000))) {
+                    LOG_WARN("Startup queue full, deferring " + task.txLower);
+                }
             }
         }
     }
 
-    // Poller loop: only getUpdates() + admin commands + enqueueing. No RPC,
-    // no market-data fetches, no sendMessage for whale reports happen here.
+    // Main poller loop
     while (g_running) {
         json resp;
         try {
@@ -2138,22 +2154,19 @@ int main() {
             long uid = upd.value("update_id", 0LL);
             if (uid >= offset) offset = uid + 1;
 
-            // Обработка команд — выполняется прямо в поллере: это быстрые
-            // операции (DB ping, несколько проверок с HEALTH_TIMEOUT_MS),
-            // не стоит уводить их в очередь воркеров.
-            if (upd.contains("message")) {
+            // Handle admin commands            if (upd.contains("message")) {
                 auto msg = upd["message"];
                 std::string text = msg.value("text", "");
                 int64_t fromId = msg.value("from", json::object()).value("id", 0LL);
                 int64_t chatId = msg.value("chat", json::object()).value("id", 0LL);
 
                 if ((text == "/stats" || text == "/health") && fromId == cfg::ADMIN_ID) {
-                    bot.handleCommand(text, chatId, stats, db, rpc, offset);
+                    bot.handleCommand(text, chatId, stats, db, rpc, offset, queue, tgSender);
                     continue;
                 }
             }
 
-            // channel_post
+            // Handle channel posts
             if (!upd.contains("channel_post")) continue;
             auto post = upd["channel_post"];
             int64_t chatId = post.value("chat", json::object()).value("id", 0LL);
@@ -2162,6 +2175,35 @@ int main() {
             std::string text = post.value("text", "");
             if (text.empty()) continue;
 
+            // Anti-loop protection — only when SOURCE == OUTPUT
+            bool selfPost = false;
+            if constexpr (cfg::SOURCE_CHANNEL == cfg::OUTPUT_CHANNEL) {
+                if (text.rfind("🔍 ANALYZER", 0) == 0) {
+                    selfPost = true;
+                }
+                if (!selfPost) {
+                    std::string authorSig = post.value("author_signature", "");
+                    if (!authorSig.empty()) {
+                        std::string sigLower = authorSig;
+                        std::transform(sigLower.begin(), sigLower.end(), sigLower.begin(),
+                                       [](unsigned char c){ return std::tolower(c); });
+                        if (sigLower.find("analyzer") != std::string::npos) {
+                            selfPost = true;
+                        }
+                    }
+                }
+                if (!selfPost && post.contains("via_bot")) {
+                    int64_t viaBotId = post["via_bot"].value("id", 0LL);
+                    if (bot.botId() != 0 && viaBotId == bot.botId()) {
+                        selfPost = true;
+                    }
+                }
+            }
+
+            if (selfPost) {
+                LOG_INFO("Ignoring self-generated post");
+                continue;
+            }
             stats.totalMessagesReceived++;
             db.incMessages();
 
@@ -2172,12 +2214,7 @@ int main() {
             }
             std::string txLower = classifier::toLower(p.txHash);
 
-            // FIX #4: tryClaim() is the atomic "is this new AND mark it as
-            // ours" check, done here in the poller (single-threaded with
-            // respect to itself) so duplicate channel_posts for the same tx
-            // never even enter the queue, regardless of how many workers
-            // later race to drain it.
-            if (!db.tryClaim(txLower)) {
+            if (!db.tryClaim(txLower, p)) {
                 LOG_INFO("Duplicate TX, skip: " + txLower);
                 continue;
             }
@@ -2186,15 +2223,6 @@ int main() {
             task.parsed = p;
             task.txLower = txLower;
 
-            // FIX #14 (review point #2): push() blocking under backpressure
-            // when the queue is full is intentional (see MAX_QUEUE_SIZE
-            // comment) — the alternative is unbounded memory growth or
-            // silently dropping whale alerts. But a long block here means
-            // the poller has stopped reading new Telegram updates, which
-            // is worth surfacing to an operator even though it isn't a bug
-            // by itself. Measure the wait and warn if it's unusually long,
-            // purely as an observability signal — this does not change
-            // push()'s blocking behavior at all.
             auto pushStart = std::chrono::steady_clock::now();
             bool pushed = queue.push(std::move(task));
             auto pushWaitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2202,37 +2230,21 @@ int main() {
             if (pushWaitMs > cfg::QUEUE_BLOCKED_WARN_MS) {
                 LOG_WARN("Poller blocked " + std::to_string(pushWaitMs) +
                          "ms pushing to a full queue (size cap " +
-                         std::to_string(cfg::MAX_QUEUE_SIZE) +
-                         ") -- Telegram updates were not being read during "
-                         "this time. Workers may be stuck; check /health.");
+                         std::to_string(cfg::MAX_QUEUE_SIZE) + ")");
             }
             if (!pushed) {
-                // Queue is shutting down (bot is exiting). This tx is
-                // already marked status=0 in processed_tx via tryClaim()
-                // above, so it's not lost: reclaimStaleQueued() will pick
-                // it back up and requeue it on the next startup.
-                LOG_WARN("Queue shutting down, tx " + txLower + " deferred to next startup");
+                LOG_WARN("claimed_not_queued: tx " + txLower +
+                         " claimed in DB but queue shut down; will be recovered on next startup");
             }
         }
 
-        // FIX #4: offset is saved as soon as updates are claimed/queued,
-        // not after worker processing finishes — the poller no longer
-        // waits on workers at all. See the FIX #4 block comment above
-        // WhaleTask for why redelivery after a crash is safe (tryClaim()
-        // makes requeuing a tx we already own a no-op).
         if (!updates.empty()) {
             db.saveOffset(offset);
         }
     }
 
-    LOG_INFO("Shutting down: stopping watchdog and stale-task reclaimer...");
-    // Stop these BEFORE queue.shutdown()/workers.joinAll(): otherwise
-    // Watchdog could react to a heartbeat going stale *because* a worker
-    // is mid-shutdown (not actually hung) and spin up a pointless
-    // replacement, or StaleTaskReclaimer could push() into a queue that's
-    // already draining. Neither would corrupt anything (push() after
-    // shutdown() just returns false), but stopping them first avoids the
-    // noise entirely.
+    LOG_INFO("Shutting down: stopping background threads...");
+    rpcLogger.stop();
     watchdog.stop();
     staleReclaimer.stop();
 
@@ -2240,8 +2252,11 @@ int main() {
     queue.shutdown();
     workers.joinAll();
 
+    LOG_INFO("Shutting down: stopping Telegram sender...");    tgSender.stop();
+
     LOG_INFO("Stopping maintenance thread...");
     maint.stop();
+
     LOG_INFO("=== Shutdown complete ===");
     return 0;
 }
