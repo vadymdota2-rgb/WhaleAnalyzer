@@ -10,7 +10,8 @@
 //      with `db.getTotalProcessed()`, which is what CLEANUP_TRIGGER is
 //      meant to track (row count in processed_tx).
 // ============================================================================
-
+#define CPPHTTPLIB_OPENSSL_SUPPORT
+#include <cctype>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
