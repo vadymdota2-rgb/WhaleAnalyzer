@@ -76,8 +76,8 @@ inline const std::string& getBotToken() {
     return token;
 }
 
-const int64_t     SOURCE_CHANNEL   = -1003978563317LL;
-const int64_t     OUTPUT_CHANNEL   = -1003978563317LL;
+const int64_t     SOURCE_CHANNEL   = -1001234567890LL;
+const int64_t     OUTPUT_CHANNEL   = -1009876543210LL;
 const int64_t     ADMIN_ID         = 123456789;  // Твой Telegram user ID
 
 const std::vector<std::string> BSC_RPC = {
@@ -324,9 +324,6 @@ HttpResponse doRequest(Client& cli, const std::string& path, int timeout_ms, int
                        const std::string* body = nullptr, const std::string* contentType = nullptr) {
     cli.set_connection_timeout(timeout_ms / 1000);
     cli.set_read_timeout(timeout_ms / 1000);
-            cli.set_write_timeout(timeout_ms / 1000);
-            cli.set_keep_alive(false);
-            cli.set_address_family(AF_INET);
 
     HttpResponse resp;
     for (int i = 0; i <= retries; ++i) {
@@ -1109,7 +1106,6 @@ TxInfo classify(const json& tx, const json& receipt, const std::string& whaleAdd
     std::string whale = toLower(whaleAddr);
 
     json logs = receipt.value("logs", json::array());
-LOG_INFO("LOGS_COUNT=" + std::to_string(logs.size()));
 
     bool whaleSentStable = false;
     bool whaleGotStable = false;
@@ -1118,7 +1114,6 @@ LOG_INFO("LOGS_COUNT=" + std::to_string(logs.size()));
     std::string tokenContract;
 
     for (const auto& log : logs) {
-LOG_INFO("LOG_ADDR=" + log.value("address",""));
         auto topics = log.value("topics", json::array());
         if (topics.size() < 3) continue;
         std::string topic0 = toLower(topics[0].get<std::string>());
@@ -1147,8 +1142,6 @@ LOG_INFO("LOG_ADDR=" + log.value("address",""));
         }
     }
 
-LOG_INFO("DEBUG tokenContract=[" + tokenContract + "]");
-LOG_INFO("FLAGS sentStable=" + std::to_string(whaleSentStable) + " gotStable=" + std::to_string(whaleGotStable) + " sentToken=" + std::to_string(whaleSentToken) + " gotToken=" + std::to_string(whaleGotToken));
     info.tokenAddr = tokenContract;
 
     if (whaleSentStable && whaleGotToken) {
@@ -1306,7 +1299,7 @@ private:
 
         md.source = "DexScreener";
         md.ok = true;
-        try { md.priceUsd = std::stod(best.value("priceUsd", std::string("0"))); } catch(...) { md.priceUsd = 0; }
+        md.priceUsd = best.value("priceUsd", 0.0);
         md.liquidityUsd = bestLiq;
         md.symbol = best.value("baseToken", json::object()).value("symbol", "");
         md.pairAddress = best.value("pairAddress", "");

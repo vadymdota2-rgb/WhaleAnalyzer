@@ -1,0 +1,80 @@
+nohup: ignoring input
+[2026-06-22 06:21:07] [INFO] === Analyzer Bot v1.0 FINAL PRODUCTION HARDENED ===
+[2026-06-22 06:21:07] [WARN] auto_vacuum is NOT incremental (mode=0). This likely means the DB file pre-dates this PRAGMA. incremental_vacuum calls will be no-ops until a one-time `VACUUM;` is run manually on this DB file to apply the new mode.
+[2026-06-22 06:21:07] [INFO] DB opened: analyzer.db
+[2026-06-22 06:21:07] [INFO] Stats loaded from DB: messages=0 tx=0
+[2026-06-22 06:21:07] [INFO] Start offset=677860467
+[2026-06-22 06:21:07] [INFO] Started 3 worker thread(s)
+[2026-06-22 06:24:14] [WARN] HTTP 409 retry=0
+[2026-06-22 06:24:20] [WARN] HTTP 409 retry=1
+[2026-06-22 06:24:25] [WARN] HTTP 409 retry=0
+[2026-06-22 06:24:31] [WARN] HTTP 409 retry=1
+[2026-06-22 06:24:36] [WARN] HTTP 409 retry=0
+[2026-06-22 06:24:41] [WARN] HTTP 409 retry=1
+[2026-06-22 06:24:47] [WARN] HTTP 409 retry=0
+[2026-06-22 06:24:52] [WARN] HTTP 409 retry=1
+[2026-06-22 06:24:58] [WARN] HTTP 409 retry=0
+[2026-06-22 06:25:03] [WARN] HTTP 409 retry=1
+[2026-06-22 06:25:09] [WARN] HTTP 409 retry=0
+[2026-06-22 06:37:07] [ERR] Watchdog: worker[0] heartbeat stale for 960s (limit 900s) -- starting replacement #1 for this slot (of 10 allowed). The original thread is left running; see WorkerHeartbeats comment for why it cannot be safely killed.
+[2026-06-22 06:37:07] [ERR] Watchdog: worker[1] heartbeat stale for 960s (limit 900s) -- starting replacement #1 for this slot (of 10 allowed). The original thread is left running; see WorkerHeartbeats comment for why it cannot be safely killed.
+[2026-06-22 06:37:07] [ERR] Watchdog: worker[2] heartbeat stale for 960s (limit 900s) -- starting replacement #1 for this slot (of 10 allowed). The original thread is left running; see WorkerHeartbeats comment for why it cannot be safely killed.
+[2026-06-22 06:42:30] [WARN] HTTP 409 retry=0
+[2026-06-22 06:42:35] [WARN] HTTP 409 retry=1
+[2026-06-22 06:42:41] [WARN] HTTP 409 retry=0
+[2026-06-22 06:42:46] [WARN] HTTP 409 retry=1
+[2026-06-22 06:42:52] [WARN] HTTP 409 retry=0
+[2026-06-22 06:42:57] [WARN] HTTP 409 retry=0
+[2026-06-22 06:43:02] [WARN] HTTP 409 retry=1
+[2026-06-22 06:43:08] [WARN] HTTP 409 retry=0
+[2026-06-22 06:43:13] [WARN] HTTP 409 retry=1
+[2026-06-22 06:43:19] [WARN] HTTP 409 retry=0
+[2026-06-22 06:53:07] [ERR] Watchdog: worker[0] heartbeat stale for 960s (limit 900s) -- starting replacement #2 for this slot (of 10 allowed). The original thread is left running; see WorkerHeartbeats comment for why it cannot be safely killed.
+[2026-06-22 06:53:07] [ERR] Watchdog: worker[1] heartbeat stale for 960s (limit 900s) -- starting replacement #2 for this slot (of 10 allowed). The original thread is left running; see WorkerHeartbeats comment for why it cannot be safely killed.
+[2026-06-22 06:53:07] [ERR] Watchdog: worker[2] heartbeat stale for 960s (limit 900s) -- starting replacement #2 for this slot (of 10 allowed). The original thread is left running; see WorkerHeartbeats comment for why it cannot be safely killed.
+[2026-06-22 06:59:59] [WARN] HTTP 409 retry=0
+[2026-06-22 07:00:04] [WARN] HTTP 409 retry=1
+[2026-06-22 07:00:10] [WARN] HTTP 409 retry=0
+[2026-06-22 07:00:15] [WARN] HTTP 409 retry=1
+[2026-06-22 07:00:21] [WARN] HTTP 409 retry=0
+[2026-06-22 07:00:26] [WARN] HTTP 409 retry=1
+[2026-06-22 07:00:32] [WARN] HTTP 409 retry=0
+[2026-06-22 07:00:37] [WARN] HTTP 409 retry=1
+[2026-06-22 07:00:43] [WARN] HTTP 409 retry=0
+[2026-06-22 07:00:48] [WARN] HTTP 409 retry=1
+[2026-06-22 07:00:54] [WARN] HTTP 409 retry=0
+[2026-06-22 07:00:59] [WARN] HTTP 409 retry=1
+[2026-06-22 07:01:05] [WARN] HTTP 409 retry=0
+[2026-06-22 07:01:10] [WARN] HTTP 409 retry=1
+[2026-06-22 07:01:16] [WARN] HTTP 409 retry=0
+[2026-06-22 07:01:21] [WARN] HTTP 409 retry=1
+[2026-06-22 07:01:27] [WARN] HTTP 409 retry=0
+[2026-06-22 07:01:32] [WARN] HTTP 409 retry=1
+[2026-06-22 07:01:38] [WARN] HTTP 409 retry=0
+[2026-06-22 07:01:43] [WARN] HTTP 409 retry=1
+[2026-06-22 07:01:49] [WARN] HTTP 409 retry=0
+[2026-06-22 07:01:54] [WARN] HTTP 409 retry=1
+[2026-06-22 07:02:00] [WARN] HTTP 409 retry=0
+[2026-06-22 07:02:05] [WARN] HTTP 409 retry=1
+[2026-06-22 07:02:11] [WARN] HTTP 409 retry=0
+[2026-06-22 07:02:16] [WARN] HTTP 409 retry=1
+[2026-06-22 07:02:22] [WARN] HTTP 409 retry=0
+[2026-06-22 07:02:27] [WARN] HTTP 409 retry=1
+[2026-06-22 07:02:33] [WARN] HTTP 409 retry=0
+[2026-06-22 07:02:38] [WARN] HTTP 409 retry=1
+[2026-06-22 07:02:44] [WARN] HTTP 409 retry=0
+[2026-06-22 07:02:49] [INFO] Signal received, shutting down...
+[2026-06-22 07:02:49] [WARN] HTTP 409 retry=1
+[2026-06-22 07:02:50] [INFO] Shutting down: stopping watchdog and stale-task reclaimer...
+[2026-06-22 07:02:50] [INFO] Shutting down: draining worker queue...
+[2026-06-22 07:02:50] [INFO] worker[0] exiting
+[2026-06-22 07:02:50] [INFO] worker[1] exiting
+[2026-06-22 07:02:50] [INFO] worker[2] exiting
+[2026-06-22 07:02:50] [INFO] worker[1] exiting
+[2026-06-22 07:02:50] [INFO] worker[0] exiting
+[2026-06-22 07:02:50] [INFO] worker[1] exiting
+[2026-06-22 07:02:50] [INFO] worker[2] exiting
+[2026-06-22 07:02:50] [INFO] worker[2] exiting
+[2026-06-22 07:02:50] [INFO] worker[0] exiting
+[2026-06-22 07:02:50] [INFO] Stopping maintenance thread...
+[2026-06-22 07:02:50] [INFO] === Shutdown complete ===

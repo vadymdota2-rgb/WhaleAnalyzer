@@ -1,0 +1,204 @@
+main.cpp: In function ‘Http::HttpResponse Http::post(const std::string&, const json&, int, int)’:
+main.cpp:382:25: error: no matching function for call to ‘doRequest(httplib::SSLClient&, std::string&, int&, int&, std::string*, const char [17])’
+  382 |         return doRequest(cli, p.path, timeout_ms, retries, &dump, "application/json");
+      |                ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.cpp:323:14: note: candidate: ‘template<class Client> Http::HttpResponse Http::doRequest(Client&, const std::string&, int, int, const std::string*, const std::string*)’
+  323 | HttpResponse doRequest(Client& cli, const std::string& path, int timeout_ms, int retries,
+      |              ^~~~~~~~~
+main.cpp:323:14: note:   template argument deduction/substitution failed:
+main.cpp:382:67: note:   cannot convert ‘"application/json"’ (type ‘const char [17]’) to type ‘const std::string*’ {aka ‘const std::__cxx11::basic_string<char>*’}
+  382 |         return doRequest(cli, p.path, timeout_ms, retries, &dump, "application/json");
+      |                                                                   ^~~~~~~~~~~~~~~~~~
+main.cpp:385:25: error: no matching function for call to ‘doRequest(httplib::Client&, std::string&, int&, int&, std::string*, const char [17])’
+  385 |         return doRequest(cli, p.path, timeout_ms, retries, &dump, "application/json");
+      |                ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.cpp:323:14: note: candidate: ‘template<class Client> Http::HttpResponse Http::doRequest(Client&, const std::string&, int, int, const std::string*, const std::string*)’
+  323 | HttpResponse doRequest(Client& cli, const std::string& path, int timeout_ms, int retries,
+      |              ^~~~~~~~~
+main.cpp:323:14: note:   template argument deduction/substitution failed:
+main.cpp:385:67: note:   cannot convert ‘"application/json"’ (type ‘const char [17]’) to type ‘const std::string*’ {aka ‘const std::__cxx11::basic_string<char>*’}
+  385 |         return doRequest(cli, p.path, timeout_ms, retries, &dump, "application/json");
+      |                                                                   ^~~~~~~~~~~~~~~~~~
+main.cpp: In instantiation of ‘Http::HttpResponse Http::doRequest(Client&, const std::string&, int, int, const std::string*, const std::string*) [with Client = httplib::SSLClient; std::string = std::__cxx11::basic_string<char>]’:
+main.cpp:368:25:   required from here
+  368 |         return doRequest(cli, p.path, timeout_ms, retries);
+      |                ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.cpp:332:17: error: no match for ‘operator=’ (operand types are ‘std::shared_ptr<httplib::Response>’ and ‘httplib::Result’)
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/c++/14/condition_variable:45,
+                 from ./httplib.h:315,
+                 from main.cpp:15:
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<const std::shared_ptr<_Yp>&> std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Yp>&) [with _Tp = httplib::Response]’
+  417 |         operator=(const shared_ptr<_Yp>& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘const std::shared_ptr<_Tp>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::auto_ptr<_Up> > std::shared_ptr<_Tp>::operator=(std::auto_ptr<_Up>&&) [with _Tp = httplib::Response]’
+  428 |         operator=(auto_ptr<_Yp>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘std::auto_ptr<_Up>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::shared_ptr<_Yp> > std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Yp>&&) [with _Tp = httplib::Response]’
+  445 |         operator=(shared_ptr<_Yp>&& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘std::shared_ptr<_Tp>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note: candidate: ‘template<class _Yp, class _Del> std::shared_ptr<_Tp>::_Assignable<std::unique_ptr<_Up, _Ep> > std::shared_ptr<_Tp>::operator=(std::unique_ptr<_Up, _Ep>&&) [with _Del = _Yp; _Tp = httplib::Response]’
+  453 |         operator=(unique_ptr<_Yp, _Del>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘std::unique_ptr<_Tp, _Dp>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:19: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Tp>&) [with _Tp = httplib::Response]’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                   ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:29: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘const std::shared_ptr<httplib::Response>&’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                             ^~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:7: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Tp>&&) [with _Tp = httplib::Response]’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |       ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:30: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘std::shared_ptr<httplib::Response>&&’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |                 ~~~~~~~~~~~~~^~~
+main.cpp:334:17: error: no match for ‘operator=’ (operand types are ‘std::shared_ptr<httplib::Response>’ and ‘httplib::Result’)
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<const std::shared_ptr<_Yp>&> std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Yp>&) [with _Tp = httplib::Response]’
+  417 |         operator=(const shared_ptr<_Yp>& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘const std::shared_ptr<_Tp>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::auto_ptr<_Up> > std::shared_ptr<_Tp>::operator=(std::auto_ptr<_Up>&&) [with _Tp = httplib::Response]’
+  428 |         operator=(auto_ptr<_Yp>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘std::auto_ptr<_Up>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::shared_ptr<_Yp> > std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Yp>&&) [with _Tp = httplib::Response]’
+  445 |         operator=(shared_ptr<_Yp>&& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘std::shared_ptr<_Tp>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note: candidate: ‘template<class _Yp, class _Del> std::shared_ptr<_Tp>::_Assignable<std::unique_ptr<_Up, _Ep> > std::shared_ptr<_Tp>::operator=(std::unique_ptr<_Up, _Ep>&&) [with _Del = _Yp; _Tp = httplib::Response]’
+  453 |         operator=(unique_ptr<_Yp, _Del>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘std::unique_ptr<_Tp, _Dp>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:19: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Tp>&) [with _Tp = httplib::Response]’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                   ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:29: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘const std::shared_ptr<httplib::Response>&’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                             ^~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:7: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Tp>&&) [with _Tp = httplib::Response]’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |       ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:30: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘std::shared_ptr<httplib::Response>&&’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |                 ~~~~~~~~~~~~~^~~
+main.cpp: In instantiation of ‘Http::HttpResponse Http::doRequest(Client&, const std::string&, int, int, const std::string*, const std::string*) [with Client = httplib::Client; std::string = std::__cxx11::basic_string<char>]’:
+main.cpp:371:25:   required from here
+  371 |         return doRequest(cli, p.path, timeout_ms, retries);
+      |                ~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+main.cpp:332:17: error: no match for ‘operator=’ (operand types are ‘std::shared_ptr<httplib::Response>’ and ‘httplib::Result’)
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<const std::shared_ptr<_Yp>&> std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Yp>&) [with _Tp = httplib::Response]’
+  417 |         operator=(const shared_ptr<_Yp>& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘const std::shared_ptr<_Tp>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::auto_ptr<_Up> > std::shared_ptr<_Tp>::operator=(std::auto_ptr<_Up>&&) [with _Tp = httplib::Response]’
+  428 |         operator=(auto_ptr<_Yp>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘std::auto_ptr<_Up>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::shared_ptr<_Yp> > std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Yp>&&) [with _Tp = httplib::Response]’
+  445 |         operator=(shared_ptr<_Yp>&& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘std::shared_ptr<_Tp>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note: candidate: ‘template<class _Yp, class _Del> std::shared_ptr<_Tp>::_Assignable<std::unique_ptr<_Up, _Ep> > std::shared_ptr<_Tp>::operator=(std::unique_ptr<_Up, _Ep>&&) [with _Del = _Yp; _Tp = httplib::Response]’
+  453 |         operator=(unique_ptr<_Yp, _Del>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note:   template argument deduction/substitution failed:
+main.cpp:332:17: note:   ‘httplib::Result’ is not derived from ‘std::unique_ptr<_Tp, _Dp>’
+  332 |             res = cli.Post(path.c_str(), *body, contentType->c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:19: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Tp>&) [with _Tp = httplib::Response]’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                   ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:29: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘const std::shared_ptr<httplib::Response>&’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                             ^~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:7: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Tp>&&) [with _Tp = httplib::Response]’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |       ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:30: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘std::shared_ptr<httplib::Response>&&’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |                 ~~~~~~~~~~~~~^~~
+main.cpp:334:17: error: no match for ‘operator=’ (operand types are ‘std::shared_ptr<httplib::Response>’ and ‘httplib::Result’)
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<const std::shared_ptr<_Yp>&> std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Yp>&) [with _Tp = httplib::Response]’
+  417 |         operator=(const shared_ptr<_Yp>& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:417:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘const std::shared_ptr<_Tp>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::auto_ptr<_Up> > std::shared_ptr<_Tp>::operator=(std::auto_ptr<_Up>&&) [with _Tp = httplib::Response]’
+  428 |         operator=(auto_ptr<_Yp>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:428:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘std::auto_ptr<_Up>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note: candidate: ‘template<class _Yp> std::shared_ptr<_Tp>::_Assignable<std::shared_ptr<_Yp> > std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Yp>&&) [with _Tp = httplib::Response]’
+  445 |         operator=(shared_ptr<_Yp>&& __r) noexcept
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:445:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘std::shared_ptr<_Tp>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note: candidate: ‘template<class _Yp, class _Del> std::shared_ptr<_Tp>::_Assignable<std::unique_ptr<_Up, _Ep> > std::shared_ptr<_Tp>::operator=(std::unique_ptr<_Up, _Ep>&&) [with _Del = _Yp; _Tp = httplib::Response]’
+  453 |         operator=(unique_ptr<_Yp, _Del>&& __r)
+      |         ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:453:9: note:   template argument deduction/substitution failed:
+main.cpp:334:17: note:   ‘httplib::Result’ is not derived from ‘std::unique_ptr<_Tp, _Dp>’
+  334 |             res = cli.Get(path.c_str());
+      |             ~~~~^~~~~~~~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:19: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(const std::shared_ptr<_Tp>&) [with _Tp = httplib::Response]’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                   ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:413:29: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘const std::shared_ptr<httplib::Response>&’
+  413 |       shared_ptr& operator=(const shared_ptr&) noexcept = default;
+      |                             ^~~~~~~~~~~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:7: note: candidate: ‘std::shared_ptr<_Tp>& std::shared_ptr<_Tp>::operator=(std::shared_ptr<_Tp>&&) [with _Tp = httplib::Response]’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |       ^~~~~~~~
+/usr/include/c++/14/bits/shared_ptr.h:437:30: note:   no known conversion for argument 1 from ‘httplib::Result’ to ‘std::shared_ptr<httplib::Response>&&’
+  437 |       operator=(shared_ptr&& __r) noexcept
+      |                 ~~~~~~~~~~~~~^~~
